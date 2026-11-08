@@ -2082,7 +2082,7 @@ local function CreateTabs()
     lib:CreateTab("EryAddon_Anomalies", win, "Anomalies", "Anomalies : moins cher qu'au marchand")
     if ns.CreateJobsPanel then
         local jobs = ns.CreateJobsPanel(AuctionHouseFrame)
-        lib:CreateTab("EryAddon_Jobs", jobs, "Jobs", "Jobs : monter ses métiers en gagnant de l'or")
+        lib:CreateTab("EryAddon_Jobs", jobs, "Métiers", "Métiers : monter ses métiers en gagnant de l'or")
     end
     local ventes = CreateMySalesPanel(AuctionHouseFrame)
     lib:CreateTab("EryAddon_MesVentes", ventes, "Mes ventes", "Mes ventes : délai, prix et bénéfice réels")

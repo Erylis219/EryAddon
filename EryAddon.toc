@@ -1,9 +1,10 @@
 ## Interface: 16001
 ## Title: EryAddon
-## Notes: Petites fonctions pour Ery Table. Tapez /eryaddon pour les activer ou désactiver.
+## Notes: Hôtel des ventes, métiers et plus (client français). Tapez /eryaddon pour activer ou désactiver chaque fonction.
 ## Author: Jérémie
-## Version: 0.50.0
+## Version: 0.51.0
 ## SavedVariables: EryAddonDB
+## X-Curse-Project-ID: 1791316
 
 EryAddon.lua
 EryAddon_Theme.lua

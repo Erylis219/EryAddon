@@ -18,7 +18,7 @@ local issecret = ns.issecret
 
 local Jobs = {
     key = "jobs",
-    label = "Métiers : onglet « Jobs » (monter ses métiers)",
+    label = "Onglet « Métiers » (monter ses métiers)",
 }
 table.insert(ns.features, Jobs)
 ns.DEFAULTS.jobs = true
@@ -1402,7 +1402,7 @@ function ns.CreateJobsPanel(parent)
         p:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -8, 28)
         H.Skin(p)
     else
-        p = H.Window("EryJobsFrame", 980, 600, "Jobs", "Monter ses métiers")
+        p = H.Window("EryJobsFrame", 980, 600, "Métiers", "Monter ses métiers")
         p:SetPoint("CENTER", 150, 0)
     end
     p:EnableMouse(true)
@@ -2256,7 +2256,7 @@ end
 local function MakeButtons(host)
     if host.eryButtons then return host.eryButtons end
     local H = ns.Holo
-    local b = H.Button(host, "Jobs", 70, 20, "solid")
+    local b = H.Button(host, "Métiers", 70, 20, "solid")
     b:SetPoint("BOTTOMRIGHT", host, "TOPRIGHT", -4, 2)
     b:SetScript("OnClick", ToggleStandalone)
     host.eryButtons = b

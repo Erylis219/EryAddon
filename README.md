@@ -1,7 +1,7 @@
 # EryAddon
 
 Add-on pour **World of Warcraft: Forever** (client en français) : hôtel des ventes (anomalies, mes ventes,
-étude du marché), métiers (onglet Jobs), icônes dans les sacs, carte des livres, etc.
+étude du marché), métiers (onglet Métiers), icônes dans les sacs, carte des livres, etc.
 Tape `/eryaddon` en jeu pour activer ou désactiver chaque fonction.
 
 Il faut aussi l'add-on **Auctionator** (onglets de l'hôtel des ventes et prix dans les sacs).
