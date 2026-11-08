@@ -1,0 +1,14 @@
+## Interface: 16001
+## Title: EryAddon
+## Notes: Petites fonctions pour Ery Table. Tapez /eryaddon pour les activer ou désactiver.
+## Author: Jérémie
+## Version: 0.50.0
+## SavedVariables: EryAddonDB
+
+EryAddon.lua
+EryAddon_Theme.lua
+EryAddon_HV.lua
+EryAddon_Recettes.lua
+EryAddon_Metiers.lua
+EryAddon_Jobs.lua
+EryAddon_Quetes.lua
