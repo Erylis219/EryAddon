@@ -168,6 +168,116 @@ local function SearchKey(e)
     return e.itemKey or C_AuctionHouse.MakeItemKey(e.id)
 end
 
+---------------------------------------------------------------------------
+-- PALIERS (08/11, idée de Jérémie : 2 Délices de déviant à 38 pa sous 64 à 56 pa, achetés puis
+-- revendus). Une « poche » d'annonces bradées sous un « mur » d'annonces au même prix : on achète la
+-- poche, on revend 1 pa sous le mur. Ces lignes entrent dans Anomalies (kind = "palier") et passent par
+-- le même circuit (vérification, achat express, file d'enchères) ; pour elles, e.vendor = revente NETTE
+-- à l'HV visée (mur − 1 pa, − 5 %), e.maxUnit = prix d'achat maximum, e.capQty = quantité maximum.
+-- Chiffres de référence : TSM (ns.TSM, EryAddon.lua). Sans TSM : pas de paliers.
+-- Règles (étude du 08/11 + réglages par défaut de TSM lus dans son code) :
+--   - candidat au scan : se vend (≥ 1 / jour par HV, ≥ 30 % des annonces partent) et prix le plus bas
+--     ≤ 80 % de la revente nette de référence ; 60 candidats au plus (vérifiés un par un) ;
+--   - mur : ≥ 5 exemplaires entre son prix et +25 %, poche ≤ moitié du mur ;
+--   - revente plafonnée à 1,3 x la référence : un mur à 2 x ou 5 x le prix du marché est souvent posé
+--     par TSM sur un marché vide (ses prix « normal » et « max »), pas de vrais acheteurs ;
+--   - 1 pa sous le mur (le jeu n'accepte que des prix ronds à la pièce d'argent) : devant tous les vendeurs TSM, qui s'alignent sans passer dessous ;
+--   - 20 % de marge par exemplaire, 5 pa de gain au moins, 2 jours de ventes au plus.
+---------------------------------------------------------------------------
+local PALIER_COMMISSION = 0.05
+local PALIER_MARGE = 1.2         -- revente nette ≥ 1,2 x prix d'achat
+local PALIER_GAIN_MIN = 500      -- 5 pa
+local PALIER_CANDIDATS = 60
+local PALIER_JOURS = 2           -- jamais plus que 2 jours de ventes (par HV, d'après TSM)
+local PALIER_MUR_MIN = 5
+local PALIER_PLAFOND = 1.3       -- revente ≤ 1,3 x la référence TSM
+local PALIER_ICON = "|TInterface\\Minimap\\Tracking\\Auctioneer:14:14|t "
+local palierSounded = false      -- son déjà joué pour ce scan (idée reprise du Sniper de TSM)
+
+-- Prix de référence d'un objet (cuivre) : le plus prudent entre le prix de vente moyen réel (région),
+-- le prix du marché lissé et le prix RÉCENT (dernier cliché horaire de TSM). Le prix récent est
+-- indispensable : Forever a 4 jours, les prix baissent chaque jour et les moyennes restent trop hautes
+-- (essai hors jeu du 08/11 : un objet à 200 po « valait » 88 894 po en moyenne). Et ses ventes par jour
+-- / part des annonces vendues.
+local function PalierRef(itemID)
+    if not ns.TSM then return nil end
+    local ref
+    for _, source in ipairs({ "DBRegionSaleAvg", "DBMarket", "DBRecent" }) do
+        local v = ns.TSM(source, itemID)
+        if v and v > 0 and (not ref or v < ref) then ref = v end
+    end
+    if not ref then return nil end
+    return ref, ns.TSM("DBRegionSoldPerDay", itemID), ns.TSM("DBRegionSaleRate", itemID)
+end
+
+-- Prix d'achat maximum d'une ligne (palier : marge comprise ; anomalie marchand : le prix marchand).
+local function Limit(e)
+    return e.maxUnit or e.vendor
+end
+
+-- Exemplaires qu'on peut encore acheter pour cette ligne (palier : 2 jours de ventes moins ce qui est
+-- déjà acheté).
+local function CapLeft(e)
+    if not e.capQty then return math.huge end
+    return math.max(0, e.capQty - (e.bought or 0))
+end
+
+-- Paliers d'une liste d'annonces { {p = prix unitaire, q = quantité}, … } (les siennes exclues).
+-- Renvoie nil, ou { resale (prix de mise en vente), net, maxUnit, qty, cost, gain, wall, wallQty }.
+local function PalierFromLevels(levels, ref, perDay)
+    table.sort(levels, function(a, b) return a.p < b.p end)
+    local cap = math.max(1, math.floor((perDay or 0) * PALIER_JOURS))
+    local best
+    for j = 2, #levels do
+        local wall = levels[j].p
+        local solid, pocket = 0, 0
+        for k = j, #levels do
+            if levels[k].p <= wall * 1.25 then solid = solid + levels[k].q end
+        end
+        for k = 1, j - 1 do pocket = pocket + levels[k].q end
+        if solid >= PALIER_MUR_MIN and pocket * 2 <= solid then
+            -- Prix de mise en vente : pièces d'argent entières seulement (le jeu refuse 67 pa 99, accepte 68 pa).
+            local resale = math.min(math.ceil(wall / 100) * 100 - 100, math.floor(ref * PALIER_PLAFOND / 100) * 100)
+            local net = math.floor(resale * (1 - PALIER_COMMISSION))
+            local maxUnit = math.floor(net / PALIER_MARGE)
+            local qty, cost = 0, 0
+            for k = 1, j - 1 do
+                local l = levels[k]
+                if l.p > maxUnit or qty >= cap then break end
+                local n = math.min(l.q, cap - qty)
+                qty, cost = qty + n, cost + n * l.p
+            end
+            local gain = net * qty - cost
+            if qty > 0 and (not best or gain > best.gain) then
+                best = { resale = resale, net = net, maxUnit = maxUnit, qty = qty, cost = cost, gain = gain,
+                    wall = wall, wallQty = solid, cap = cap }
+            end
+        end
+    end
+    if best and best.gain >= PALIER_GAIN_MIN and best.gain >= best.cost * (PALIER_MARGE - 1) then return best end
+    return nil
+end
+ns._PalierFromLevels = PalierFromLevels -- pour le test hors jeu
+
+-- Candidat palier au scan rapide (on ne voit que le prix le plus bas) : vérifié ensuite par une recherche.
+local function PalierCandidate(itemID, minPrice)
+    local ref, perDay, rate = PalierRef(itemID)
+    if not ref or not perDay or perDay < 1 then return nil end
+    if rate and rate < 0.3 then return nil end
+    -- Pré-tri sur le prix RÉCENT (annonces les moins chères du dernier cliché horaire = niveau du mur
+    -- actuel) : sinon le Délice de Jérémie (38 pa sous 56 pa, moyenne TSM 43 pa) n'était pas détecté.
+    -- La référence prudente (ref) ne sert qu'à plafonner la revente, après vérification.
+    local level = ns.TSM("DBRecent", itemID)
+    if not level or level <= 0 then level = ref end
+    local net = math.floor(level * (1 - PALIER_COMMISSION)) -- revente estimée au niveau actuel
+    if minPrice > net * 0.8 or net - minPrice < 10 then return nil end
+    -- Niveau plus de 5 fois au-dessus du prix actuel : donnée TSM incohérente (objet rare, prix délirant
+    -- d'un jour) plutôt qu'une affaire ; on ne perd pas une place de candidat pour ça.
+    if level > minPrice * 5 then return nil end
+    return ref, perDay, net
+end
+ns._PalierCandidate = PalierCandidate -- pour le test hors jeu
+
 local function ConsiderItem(itemID, minPrice, itemKey)
     local name, icon, _, vendor = ItemData(itemID)
     if not name or vendor == nil then return false end
@@ -177,6 +287,29 @@ local function ConsiderItem(itemID, minPrice, itemKey)
         return true
     end
     Phantoms()[itemID] = nil -- prix différent : on le réexamine
+    if entry and entry.kind == "palier" and minPrice < vendor then
+        -- Était un palier, devient une anomalie marchand (plus sûre) : on repart de zéro.
+        for i, x in ipairs(liveList) do if x == entry then table.remove(liveList, i) break end end
+        entry, liveSeen[itemID] = nil, nil
+    end
+    if entry and entry.kind == "palier" then
+        local net = entry.estNet or entry.vendor
+        if net - minPrice > entry.unitGain then entry.unitGain, entry.minPrice = net - minPrice, minPrice end
+        return true
+    end
+    if minPrice >= vendor and not entry then
+        local ref, perDay, net = PalierCandidate(itemID, minPrice)
+        if ref then
+            entry = {
+                id = itemID, name = name, icon = icon, kind = "palier", minPrice = minPrice, itemKey = itemKey,
+                vendor = net, estNet = net, maxUnit = math.floor(net / PALIER_MARGE), ref = ref, perDay = perDay,
+                capQty = math.max(1, math.floor(perDay * PALIER_JOURS)), unitGain = net - minPrice,
+            }
+            liveList[#liveList + 1] = entry
+            liveSeen[itemID] = entry
+            return true
+        end
+    end
     if minPrice < vendor then
         if entry then
             if vendor - minPrice > entry.unitGain then
@@ -214,13 +347,27 @@ local function FinishScan(missing, attempt)
         return
     end
 
+    -- Paliers : on ne garde que les PALIER_CANDIDATS plus prometteurs (une recherche chacun ensuite) :
+    -- gain par exemplaire x exemplaires vendables en 2 jours.
+    local paliers, kept = {}, {}
+    for _, e in ipairs(liveList) do
+        if e.kind == "palier" then paliers[#paliers + 1] = e else kept[#kept + 1] = e end
+    end
+    table.sort(paliers, function(a, b) return a.unitGain * a.capQty > b.unitGain * b.capQty end)
+    for i, e in ipairs(paliers) do
+        if i <= PALIER_CANDIDATS then kept[#kept + 1] = e else liveSeen[e.id] = false end
+    end
+    liveList = kept
+    local nVendor = #kept - math.min(#paliers, PALIER_CANDIDATS)
+
     SortByUnitGain(liveList)
     local saved = Saved()
     saved.items = liveList
     saved.time = time()
     scanRunning = false
     SetStatus("")
-    Msg(string.format("scan de l'HV terminé : %d objets moins chers qu'au marchand.", #liveList))
+    Msg(string.format("scan de l'HV terminé : %d objets moins chers qu'au marchand, %d paliers possibles à vérifier.",
+        nVendor, math.min(#paliers, PALIER_CANDIDATS)))
     StartDetails(liveList)
 end
 
@@ -245,10 +392,24 @@ end
 -- Seule l'étude du marché (annonces suivies) compte. L'ancienne estimation par baisse de quantité
 -- entre deux scans donnait n'importe quoi (« Acide sulfurique : 2 984 ventes par jour ») : la quantité
 -- lue par le scan varie sans qu'il y ait de vente. Elle est abandonnée.
+-- 08/11 : TSM d'abord (ventes par jour et par HV de la région Forever) : notre étude comptait ~9 fois
+-- trop (remises en vente prises pour des ventes ; comparaison faite sur 389 objets). L'étude reste en
+-- secours pour les objets que TSM ne connaît pas.
 function ns.HVSalesPerDay(itemID)
+    local tsm = ns.TSM and ns.TSM("DBRegionSoldPerDay", itemID)
+    if tsm then return tsm end
     local st = ns.MarketState and ns.MarketState(itemID)
     if st and st.parJour then return st.parJour end
     return nil
+end
+
+-- Marché mort (objet qui ne se vend pas à l'HV) : moins d'une vente tous les 10 jours d'après TSM,
+-- sinon l'étude du marché (aucune vente sur 8 h observées).
+function ns.MarketDead(itemID)
+    local tsm = ns.TSM and ns.TSM("DBRegionSoldPerDay", itemID)
+    if tsm then return tsm < 0.1 end
+    local st = ns.MarketState and ns.MarketState(itemID)
+    return (st and st.etat == "mort") and true or false
 end
 
 -- Page suivante, ou fin du scan quand le serveur a tout envoyé.
@@ -263,6 +424,11 @@ local function NextPage()
         -- l'étude des métiers (EryAddon_Metiers.lua, analysée par Claude).
         EryAddonDB.hvEcoul = nil -- ancienne estimation entre deux scans : abandonnée (voir ns.HVSalesPerDay)
         EryAddonDB.hvPrix = { date = date("%d/%m/%Y %H:%M"), t = time(), prix = scanResults, quantites = scanQty }
+        -- Dernier prix VU de chaque objet, gardé d'un scan à l'autre (même s'il n'est plus en vente ensuite) :
+        -- la fonction « base de prix » d'Auctionator, recopiée (ns.PrixHV s'en sert ; règle : pas d'Auctionator).
+        EryAddonDB.hvVu = EryAddonDB.hvVu or {}
+        local now = time()
+        for id, p in pairs(scanResults) do EryAddonDB.hvVu[id] = { p = p, t = now } end
         if ns.JobsRefresh then ns.JobsRefresh() end -- nouveaux prix : Jobs et guide recalculés
         lastScanKeys = scanKeys
         pcall(SaveStudyKeys)
@@ -303,6 +469,7 @@ local function StartScan()
     -- Nouvelle liste vide, remplie au fil des pages.
     liveList, liveSeen = {}, {}
     Saved().items = liveList
+    palierSounded = false -- un « ting » au 1er palier confirmé de ce scan
     scanToken = scanToken + 1
     local token = scanToken
     SetStatus("Scan demandé au serveur…", "Scan : envoi…")
@@ -407,7 +574,7 @@ local function ExpectPurchase(qty, expected, unitArg)
     pendingSeq = pendingSeq + 1
     local p = {
         key = pendingSeq, entry = e, id = e.id, name = e.name, vendor = e.vendor, qty = qty,
-        expected = expected, unitArg = unitArg,
+        expected = expected, unitArg = unitArg, palier = e.kind == "palier", resale = e.resale,
         before = GetMoney(), countBefore = ItemCount(e.id),
         overlap = next(pendings) ~= nil,
     }
@@ -565,13 +732,34 @@ ReportPurchase = function(p)
             paid = moneyDrop
         end
         AnoBilan() -- (reprise de l'historique AVANT d'écrire cet achat dans le journal : pas de double compte)
-        JournalAchat(string.format("%s %s (id %d) : demandé %d, reçu %d, payé %d pc, prix marchand %d pc, "
+        JournalAchat(string.format("%s %s (id %d) : demandé %d, reçu %d, payé %d pc, %s %d pc, "
             .. "annoncé total %s / unité %s", date("%d/%m %H:%M:%S"), p.name, p.id, p.qty, received, paid,
-            p.vendor, tostring(p.expected), tostring(p.unitArg)))
+            p.palier and "revente HV nette visée" or "prix marchand", p.vendor, tostring(p.expected), tostring(p.unitArg)))
 
         local blocked = false
         if received > 0 then
             ns.AddInbound(p.id, received) -- arrive par courrier
+            -- Prix réellement payé, gardé pour « Mes ventes » (bénéfice réel à la revente).
+            EryAddonDB.prixPaye = EryAddonDB.prixPaye or {}
+            EryAddonDB.prixPaye[p.id] = { unit = math.floor(paid / received + 0.5), t = time() }
+            if p.entry then p.entry.bought = (p.entry.bought or 0) + received end
+        end
+        if received > 0 and p.palier then
+            -- Palier : à revendre à l'HV (pas au marchand) ; pas dans le bilan « revente au marchand ».
+            local net = p.vendor * received
+            if net > paid then
+                Msg(string.format("|cff00ff00acheté|r %d x %s pour %s (%s l'unité). Mets-les en vente à %s : "
+                    .. "gain visé %s.", received, p.name, Money(paid), Money(paid / received),
+                    Money(p.resale or math.floor(p.vendor / (1 - PALIER_COMMISSION))), Money(net - paid)))
+            else
+                Msg(string.format("|cffff3333PERTE|r : %d x %s payés %s (%s l'unité), plus que la revente visée (%s). "
+                    .. "Achats de cet objet arrêtés.", received, p.name, Money(paid), Money(paid / received), Money(net)))
+                blocked = true
+            end
+            if received ~= p.qty then
+                Msg(string.format("   (quantité demandée : %d, reçue : %d)", p.qty, received))
+            end
+        elseif received > 0 then
             AddAnoBilan(received, paid, p.vendor)
             local resale = p.vendor * received
             if resale > paid then
@@ -664,6 +852,10 @@ function Buyer.Select(entry)
         Msg(entry.name .. " : achats arrêtés après une mauvaise surprise. Relance un scan pour réessayer.")
         return
     end
+    if CapLeft(entry) <= 0 then
+        Msg(entry.name .. " : tu en as déjà acheté autant que ce qui se vend en 2 jours. Revends-les d'abord.")
+        return
+    end
     if Buyer.state == "starting" or Buyer.state == "confirm" then
         C_AuctionHouse.CancelCommoditiesPurchase()
     end
@@ -718,15 +910,18 @@ end
 
 -- Lot rentable d'une marchandise d'après les résultats de recherche :
 -- quantité sous le prix marchand (limitée par l'argent disponible), coût total.
-local function CommodityLot(itemID, vendor, money)
+-- « vendor » = prix d'achat maximum (Limit(e)) ; « cap » = quantité maximum (paliers).
+local function CommodityLot(itemID, vendor, money, cap)
     local qty, cost, noMoney = 0, 0, false
+    cap = cap or math.huge
     for i = 1, C_AuctionHouse.GetNumCommoditySearchResults(itemID) do
         local r = C_AuctionHouse.GetCommoditySearchResultInfo(itemID, i)
-        if not r or r.unitPrice >= vendor then break end
+        if not r or r.unitPrice >= vendor or qty >= cap then break end
         if r.unitPrice > money - cost then noMoney = true end
         local available = r.quantity - (r.numOwnerItems or 0)
         local affordable = math.floor((money - cost) / r.unitPrice)
         if affordable < available then available = affordable end
+        if available > cap - qty then available = cap - qty end
         if available > 0 then
             qty = qty + available
             cost = cost + available * r.unitPrice
@@ -741,15 +936,19 @@ end
 -- exemplaires identiques sur une ligne. « quantity = 6, buyoutAmount = 500 » veut dire
 -- 6 exemplaires à 500 pc CHACUN, et un achat (PlaceBid) n'en prend QU'UN.
 -- buyoutAmount est donc un prix À L'UNITÉ.
-local function ItemLot(itemKey, vendor, money)
+-- « vendor » = valeur d'un exemplaire (marchand, ou revente nette à l'HV pour un palier) ;
+-- « limit » = prix d'achat maximum (marge d'un palier), « cap » = quantité maximum.
+local function ItemLot(itemKey, vendor, money, limit, cap)
     local best, bestGain, totalQty, totalGain, noMoney = nil, 0, 0, 0, false
+    limit, cap = limit or vendor, cap or math.huge
     for i = 1, C_AuctionHouse.GetNumItemSearchResults(itemKey) do
         local r = C_AuctionHouse.GetItemSearchResultInfo(itemKey, i)
         if r and r.buyoutAmount and not r.containsOwnerItem then
             local gain = vendor - r.buyoutAmount -- gain pour UN exemplaire
-            if gain > 0 then
-                totalQty = totalQty + (r.quantity or 1)
-                totalGain = totalGain + gain * (r.quantity or 1)
+            if gain > 0 and r.buyoutAmount < limit and totalQty < cap then
+                local n = math.min(r.quantity or 1, cap - totalQty)
+                totalQty = totalQty + n
+                totalGain = totalGain + gain * n
                 if r.buyoutAmount > money then
                     noMoney = true
                 elseif gain > bestGain then
@@ -762,7 +961,8 @@ local function ItemLot(itemKey, vendor, money)
 end
 
 -- File des enchères rentables d'un objet unique, la moins chère d'abord.
-local function ItemQueue(itemKey, vendor)
+-- « vendor » = prix d'achat maximum (Limit(e)), « cap » = quantité maximum (paliers).
+local function ItemQueue(itemKey, vendor, cap)
     local q = {}
     for i = 1, C_AuctionHouse.GetNumItemSearchResults(itemKey) do
         local r = C_AuctionHouse.GetItemSearchResultInfo(itemKey, i)
@@ -771,14 +971,61 @@ local function ItemQueue(itemKey, vendor)
         end
     end
     table.sort(q, function(a, b) return a.buyoutAmount < b.buyoutAmount end)
+    if cap and cap < math.huge then
+        local kept, n = {}, 0
+        for _, a in ipairs(q) do
+            if n >= cap then break end
+            a.quantity = math.min(a.quantity, cap - n)
+            n = n + a.quantity
+            kept[#kept + 1] = a
+        end
+        q = kept
+    end
     return q
+end
+
+-- Annonces d'un objet après une recherche, { {p, q}, … } sans les siennes (pour les paliers).
+local function SearchLevels(event, arg, itemID)
+    local levels = {}
+    if event == "COMMODITY_SEARCH_RESULTS_UPDATED" then
+        for i = 1, C_AuctionHouse.GetNumCommoditySearchResults(itemID) do
+            local r = C_AuctionHouse.GetCommoditySearchResultInfo(itemID, i)
+            local q = r and (r.quantity or 0) - (r.numOwnerItems or 0) or 0
+            if r and r.unitPrice and q > 0 then levels[#levels + 1] = { p = r.unitPrice, q = q } end
+        end
+    else
+        for i = 1, C_AuctionHouse.GetNumItemSearchResults(arg) do
+            local r = C_AuctionHouse.GetItemSearchResultInfo(arg, i)
+            if r and r.buyoutAmount and r.buyoutAmount > 0 and not r.containsOwnerItem then
+                levels[#levels + 1] = { p = r.buyoutAmount, q = r.quantity or 1 }
+            end
+        end
+    end
+    return levels
+end
+
+-- Vérification d'un palier (recherche faite) : poche et mur réels. Faux : la ligne disparaît.
+local function CheckPalier(e, event, arg)
+    local levels = SearchLevels(event, arg, e.id)
+    local p = PalierFromLevels(levels, e.ref, e.perDay)
+    if not p then return false end
+    -- Les 10 niveaux de prix les moins chers, pour l'échelle « poche / mur » de l'écran Opportunités.
+    e.levels = {}
+    for i = 1, math.min(10, #levels) do e.levels[i] = { p = levels[i].p, q = levels[i].q } end
+    e.vendor, e.maxUnit, e.resale, e.wall, e.wallQty = p.net, p.maxUnit, p.resale, p.wall, p.wallQty
+    e.capQty = (e.bought or 0) + p.qty
+    if not palierSounded then
+        palierSounded = true
+        pcall(PlaySoundFile, "Interface\\AddOns\\EryAddon\\ting.ogg", "Master")
+    end
+    return true
 end
 
 -- Résultats de recherche d'une marchandise : combien d'unités sous le prix marchand ?
 local function OnCommodityResults(itemID)
     local e = Buyer.entry
     if Buyer.state ~= "searching" or not e or e.id ~= itemID then return end
-    local qty, cost, noMoney = CommodityLot(itemID, e.vendor, Budget())
+    local qty, cost, noMoney = CommodityLot(itemID, Limit(e), Budget(), CapLeft(e))
     Buyer.qty, Buyer.cost, Buyer.noMoney = qty, cost, noMoney
     if qty > 1 and OnePerPurchase(itemID) then
         -- Un seul exemplaire par achat : prix du moins cher seulement.
@@ -795,9 +1042,9 @@ end
 local function OnItemResults(itemKey)
     local e = Buyer.entry
     if Buyer.state ~= "searching" or not e or not itemKey or itemKey.itemID ~= e.id then return end
-    local best, totalQty, totalGain, noMoney = ItemLot(itemKey, e.vendor, Budget())
+    local best, totalQty, totalGain, noMoney = ItemLot(itemKey, e.vendor, Budget(), Limit(e), CapLeft(e))
     Buyer.itemKey, Buyer.noMoney = itemKey, noMoney
-    Buyer.queue = ItemQueue(itemKey, e.vendor)
+    Buyer.queue = ItemQueue(itemKey, Limit(e), CapLeft(e))
     Buyer.auction = Buyer.queue[1]
     if not best then Buyer.queue, Buyer.auction = {}, nil end
     e.qty, e.profit = totalQty, totalGain
@@ -1185,6 +1432,10 @@ end
 local STUDY_MIN_AGE = 1800 -- 30 min : choix de Jérémie (l'HV de Forever bouge vite)
 local function StartStudyOnly()
     if detailRunning or scanRunning then return end
+    -- La sonde du scan complet tourne : l'étude attend qu'elle finisse (pas de recherches mêlées).
+    if ns._sondeEnCours then C_Timer.After(5, StartStudyOnly) return end
+    -- Nouvelle fenêtre ouverte (écran Vendre) : ses recherches passent d'abord ; pas d'étude en même temps.
+    if ns.Fenetre and ns.Fenetre.IsOpen and ns.Fenetre.IsOpen() then return end
     if not (AuctionHouseFrame and AuctionHouseFrame:IsShown()) then return end
     local list = StudyEntries(STUDY_MIN_AGE)
     if #list == 0 then return end
@@ -1221,18 +1472,23 @@ local function OnDetailResults(event, arg)
         C_Timer.After(0.3, DetailNext)
         return
     end
-    if event == "COMMODITY_SEARCH_RESULTS_UPDATED" then
-        if arg ~= e.id then return end
-        local qty, cost = CommodityLot(e.id, e.vendor, math.huge) -- sans limite d'argent : gain du lot entier
+    local isCommodity = event == "COMMODITY_SEARCH_RESULTS_UPDATED"
+    if isCommodity and arg ~= e.id then return end
+    if not isCommodity and (type(arg) ~= "table" or arg.itemID ~= e.id) then return end
+    -- Palier : poche et mur relus dans les annonces réelles ; pas de palier → ligne retirée.
+    if e.kind == "palier" and not CheckPalier(e, event, arg) then
+        e.done = true
+        MarkExhausted(e)
+    elseif isCommodity then
+        local qty, cost = CommodityLot(e.id, Limit(e), math.huge, CapLeft(e)) -- sans limite d'argent : gain du lot entier
         e.qty, e.profit, e.done = qty, e.vendor * qty - cost, qty == 0
         if e.done then MarkExhausted(e) end
     else
-        if type(arg) ~= "table" or arg.itemID ~= e.id then return end
-        local _, totalQty, totalGain = ItemLot(arg, e.vendor, math.huge)
+        local _, totalQty, totalGain = ItemLot(arg, e.vendor, math.huge, Limit(e), CapLeft(e))
         e.qty, e.profit, e.done = totalQty, totalGain, totalQty == 0
         if e.done then MarkExhausted(e) end
         -- Meilleure enchère payable, gardée pour l'achat en un clic.
-        e.queue, e.queueTime = ItemQueue(arg, e.vendor), time() -- file d'enchères pour l'achat en un clic
+        e.queue, e.queueTime = ItemQueue(arg, Limit(e), CapLeft(e)), time() -- file d'enchères pour l'achat en un clic
     end
     detailCurrent = nil
     UpdateWindow()
@@ -1274,7 +1530,7 @@ local function OnPrefetchResults(itemKey)
     if not e or type(itemKey) ~= "table" or itemKey.itemID ~= e.id then return end
     prefetch = nil
     if Buyer.entry == e and Buyer.state == "searching" then return end -- la ligne cliquée s'en charge
-    e.queue, e.queueTime = ItemQueue(itemKey, e.vendor), time()
+    e.queue, e.queueTime = ItemQueue(itemKey, Limit(e), CapLeft(e)), time()
     if #e.queue == 0 then
         e.done = true
         MarkExhausted(e)
@@ -1308,8 +1564,11 @@ end
 local function OnCommodityPrice(unitPrice, totalPrice)
     local e = Buyer.entry
     if Buyer.state ~= "starting" or not e then return end
-    if issecret(totalPrice) or issecret(unitPrice) or not totalPrice or totalPrice >= e.vendor * Buyer.qty
-        or (unitPrice and unitPrice >= e.vendor) then
+    -- (Palier : le devis doit rester sous le prix d'achat maximum, marge comprise, comme TSM qui annule
+    -- quand le devis du serveur ne correspond pas à son calcul.)
+    local limit = Limit(e)
+    if issecret(totalPrice) or issecret(unitPrice) or not totalPrice or totalPrice >= limit * Buyer.qty
+        or (unitPrice and unitPrice >= limit) then
         C_AuctionHouse.CancelCommoditiesPurchase()
         Search()
         return
@@ -1635,6 +1894,8 @@ local function RowButtonText(e)
 end
 
 UpdateWindow = function()
+    -- L'écran Opportunités de la nouvelle fenêtre suit les mêmes changements (EryAddon_Fenetre.lua).
+    if ns.OnAnoUpdate then pcall(ns.OnAnoUpdate) end
     if not win or not win:IsShown() then return end
     local saved = Saved()
     -- Objets épuisés (plus rien de rentable) : la ligne disparaît (demande de Jérémie).
@@ -1665,18 +1926,20 @@ UpdateWindow = function()
         if e then
             row.icon:SetTexture(e.icon)
             row.icon:SetDesaturated(e.done == true)
+            -- Palier (revente à l'HV) : petite icône du commissaire-priseur devant le nom.
+            local name = e.kind == "palier" and (PALIER_ICON .. e.name) or e.name
             if e.done then
                 -- Vérifié : plus rien de rentable.
-                row.name:SetText(e.name)
+                row.name:SetText(name)
                 row.gain:SetText("épuisé")
             elseif e.qty then
                 -- Vérifié par une recherche : quantité restante, et gain du PROCHAIN clic
                 -- (demande de Jérémie : pas le total, qui baisse à chaque achat).
-                row.name:SetText(string.format("%s x%d", e.name, e.qty))
+                row.name:SetText(string.format("%s x%d", name, e.qty))
                 row.gain:SetText("+" .. Money(NextClickGain(e)) .. " /clic")
             else
                 -- Pas encore vérifié : gain sur la moins chère, par unité.
-                row.name:SetText(e.name)
+                row.name:SetText(name)
                 row.gain:SetText("+" .. Money(e.unitGain) .. " /u")
             end
             local grey = e.done and 0.5 or 1
@@ -1698,6 +1961,34 @@ UpdateWindow = function()
     win.selection:SetText(Buyer.entry and Buyer.entry.name or "")
 end
 
+-- Anomalies et paliers pour l'écran OPPORTUNITÉS de la nouvelle fenêtre (EryAddon_Fenetre.lua) : mêmes
+-- données, même circuit d'achat (une seule source de vérité).
+ns.AnoAPI = {
+    Items = function()
+        local out = {}
+        for _, e in ipairs(Saved().items or {}) do if not e.done then out[#out + 1] = e end end
+        return out
+    end,
+    Select = function(e) Buyer.Select(e) end,
+    Click = function() Buyer.Click() end,
+    Prefetch = function(e) Prefetch(e) end,
+    Entry = function() return Buyer.entry, Buyer.state end,
+    ButtonText = function() return ButtonText() end,
+    RowButtonText = function(e) return RowButtonText(e) end,
+    NextClickGain = function(e) return NextClickGain(e) end,
+    Bilan = function() return AnoBilan() end,
+    Status = function() return statusText, Saved().time end,
+    Budget = function() return Budget() end,
+    IsCommodity = function(id) return IsCommodity(id) end,
+    OnePerPurchase = function(id) return OnePerPurchase(id) end,
+    Commission = PALIER_COMMISSION,
+    -- Scans (boutons de la barre du haut de la nouvelle fenêtre) et leur état en version courte.
+    StartScan = function() StartScan() end,
+    StartGlobalScan = function() StartGlobalScan() end,
+    ShortStatus = function() return shortText end,
+    IsScanning = function() return scanRunning end,
+}
+
 -- embedded = true : onglet DANS la fenêtre de l'HV ; sinon fenêtre à part, collée à droite.
 local function CreateWindow(embedded)
     if embedded then
@@ -1717,7 +2008,7 @@ local function CreateWindow(embedded)
     win:EnableMouse(true)
 
     local H = ns.Holo
-    local title = H.Label(win, "Anomalies  ·  moins cher qu'au marchand", 13, H.CYAN)
+    local title = H.Label(win, "Anomalies  ·  marchand et paliers HV", 13, H.CYAN)
     title:SetPoint("TOPLEFT", 14, -10)
 
     -- Bilan cumulé de tous les achats faits ici (revente supposée au marchand), en haut à droite ;
@@ -1815,6 +2106,21 @@ local function CreateWindow(embedded)
             Prefetch(self.entry)
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
             GameTooltip:SetItemByID(self.entry.id)
+            local e = self.entry
+            if e.kind == "palier" then
+                GameTooltip:AddLine(" ")
+                if e.resale then
+                    GameTooltip:AddLine(string.format("Revends-les à %s (mur : %d à %s)", Money(e.resale),
+                        e.wallQty or 0, Money(e.wall or 0)), 0.36, 1, 0.69)
+                else
+                    GameTooltip:AddLine("Palier à vérifier (recherche en cours)", 0.6, 0.6, 0.6)
+                end
+                if e.perDay then
+                    GameTooltip:AddLine(string.format("Se vend : env. %s par jour", e.perDay >= 10
+                        and string.format("%d", math.floor(e.perDay + 0.5))
+                        or (string.format("%.1f", e.perDay):gsub("%.", ","))), 0.85, 0.95, 1)
+                end
+            end
             GameTooltip:Show()
         end)
         row:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -2034,7 +2340,8 @@ mailWatch:SetScript("OnEvent", function() pcall(ReadInvoices) end)
 
 -- Bilan d'un objet (nil si aucune vente ni expiration) : { vendus, net, benef (si coût connu),
 -- delai (heures, moyenne), expires, depotPerdu, enCours }
-function ns.MySales(itemID)
+-- since (facultatif) : seulement ce qui s'est passé depuis cette heure (périodes de l'écran Mes ventes).
+function ns.MySales(itemID, since)
     local d = EryAddonDB and EryAddonDB.mesVentes
     if not d then return nil end
     RepairInvoiceNets(d)
@@ -2042,7 +2349,7 @@ function ns.MySales(itemID)
         depotPerdu = 0, enCours = 0 }
     local any = false
     for _, f in ipairs(d.faits or {}) do
-        if f.id == itemID then
+        if f.id == itemID and (not since or (f.t or 0) >= since) then
             any = true
             if f.kind == "vendu" then
                 s.vendus = s.vendus + (f.qty or 0)
@@ -2058,7 +2365,7 @@ function ns.MySales(itemID)
     -- Ventes annoncées dans le chat, courrier pas encore lu : comptées tout de suite, montant estimé
     -- (prix de l'annonce − 5 %), remplacé par le montant exact à l'ouverture de la boîte aux lettres.
     for _, v in ipairs(d.ventesSansCourrier or {}) do
-        if v.id == itemID then
+        if v.id == itemID and (not since or (v.t or 0) >= since) then
             any = true
             local q = v.qty or 1
             s.vendus = s.vendus + q
@@ -2079,7 +2386,7 @@ function ns.MySales(itemID)
 end
 
 -- Tous les objets que tu as vendus ou mis en vente, pour l'onglet « Mes ventes ».
-function ns.MySalesItems()
+function ns.MySalesItems(since)
     local d = EryAddonDB and EryAddonDB.mesVentes
     if d then RepairInvoiceNets(d) end
     local seen, list = {}, {}
@@ -2087,7 +2394,7 @@ function ns.MySalesItems()
         for _, f in ipairs(src) do
             if f.id and not seen[f.id] then
                 seen[f.id] = true
-                local s = ns.MySales(f.id)
+                local s = ns.MySales(f.id, since)
                 if s then s.id, s.name = f.id, f.name; list[#list + 1] = s end
             end
         end
@@ -2316,11 +2623,154 @@ local function CreateToggleButton()
 end
 
 ---------------------------------------------------------------------------
+-- SONDE DU SCAN COMPLET (08/11, demande de Jérémie : « nos limitations de scan peuvent-elles aller
+-- plus loin ? »). Le jeu a un scan complet, C_AuctionHouse.ReplicateItems : UNE demande renvoie TOUTES
+-- les annonces de l'HV une par une (prix, quantité, vendeur, temps restant), une fois par 15 min.
+-- Jamais essayé sur Forever (option désactivée dans l'Auctionator de Jérémie). La sonde le lance UNE
+-- fois, à l'ouverture de l'HV, et note ce qui arrive dans EryAddonDB.sondeReplicate (rien n'est
+-- utilisé ailleurs pour l'instant). Pour la relancer : monter SONDE_VERSION.
+---------------------------------------------------------------------------
+local SONDE_VERSION = 1
+local SONDE_CHUNK = 1000 -- annonces lues par image (pas de gel si l'HV en a beaucoup)
+local SONDE_TIMEOUT = 90
+local sonde -- { t0, token } pendant l'essai
+local sondeToken = 0
+local sondeFrame = CreateFrame("Frame")
+
+local function SondeDB()
+    local d = EryAddonDB.sondeReplicate
+    if type(d) ~= "table" then d = {}; EryAddonDB.sondeReplicate = d end
+    return d
+end
+
+local function SondeFin(d, texte)
+    ns._sondeEnCours = false
+    sonde = nil
+    sondeFrame:UnregisterAllEvents()
+    SetStatus("", "")
+    Msg(texte)
+end
+
+local function SondeLire(n, token)
+    local d = SondeDB()
+    local stats = { annonces = n, quantite = 0, avecVendeur = 0, sansInfo = 0, sansPrix = 0, piles = 0,
+        objets = 0, vendeurs = 0, temps = { [0] = 0, [1] = 0, [2] = 0, [3] = 0 }, msLecture = 0, msMaxImage = 0 }
+    local objets, vendeurs, exemples = {}, {}, {}
+    local i = 0
+    local function Etape()
+        if token ~= sondeToken then return end
+        local t = debugprofilestop()
+        local fin = math.min(n, i + SONDE_CHUNK)
+        while i < fin do
+            local ok, name, _, count, _, _, _, _, _, _, buyout, _, _, _, owner, ownerFull, _, itemID, hasAll =
+                pcall(C_AuctionHouse.GetReplicateItemInfo, i)
+            if ok then
+                local okT, left = pcall(C_AuctionHouse.GetReplicateItemTimeLeft, i)
+                count = count or 0
+                stats.quantite = stats.quantite + count
+                if count > 1 then stats.piles = stats.piles + 1 end
+                if not hasAll then stats.sansInfo = stats.sansInfo + 1 end
+                if not buyout or buyout == 0 then stats.sansPrix = stats.sansPrix + 1 end
+                local who = (type(ownerFull) == "string" and ownerFull ~= "" and ownerFull)
+                    or (type(owner) == "string" and owner ~= "" and owner) or nil
+                if who then
+                    stats.avecVendeur = stats.avecVendeur + 1
+                    if not vendeurs[who] then vendeurs[who] = true; stats.vendeurs = stats.vendeurs + 1 end
+                end
+                if itemID and not objets[itemID] then objets[itemID] = true; stats.objets = stats.objets + 1 end
+                if okT and left and stats.temps[left] then stats.temps[left] = stats.temps[left] + 1 end
+                if #exemples < 20 and (i % 500 == 0 or #exemples < 5) then
+                    exemples[#exemples + 1] = table.concat({ tostring(name), tostring(itemID), tostring(count),
+                        tostring(buyout), who and "vendeur vu" or "vendeur caché", tostring(okT and left) }, "|")
+                end
+            end
+            i = i + 1
+        end
+        local ms = debugprofilestop() - t
+        stats.msLecture = stats.msLecture + ms
+        if ms > stats.msMaxImage then stats.msMaxImage = ms end
+        if i < n then
+            SetStatus(string.format("Sonde du scan complet : %d / %d annonces lues", i, n),
+                string.format("Sonde %d/%d", i, n))
+            C_Timer.After(0, Etape)
+            return
+        end
+        stats.msLecture = math.floor(stats.msLecture)
+        stats.msMaxImage = math.floor(stats.msMaxImage)
+        local prix = EryAddonDB.hvPrix and EryAddonDB.hvPrix.prix
+        if type(prix) == "table" then
+            local c = 0
+            for _ in pairs(prix) do c = c + 1 end
+            stats.objetsDernierScan = c
+        end
+        d.stats, d.exemples, d.etat = stats, exemples, "ok"
+        d.version, d.fait = SONDE_VERSION, true
+        SondeFin(d, string.format("sonde du scan complet : %d annonces de %d objets reçues en %d s ; vendeur visible sur %d %%.",
+            n, stats.objets, math.floor(d.reponse or 0), n > 0 and math.floor(stats.avecVendeur * 100 / n) or 0))
+    end
+    Etape()
+end
+
+sondeFrame:SetScript("OnEvent", function(_, event)
+    if not sonde then return end
+    local d = SondeDB()
+    if event == "AUCTION_HOUSE_CLOSED" then
+        sondeToken = sondeToken + 1
+        d.etat = "interrompu (HV fermé), réessai à la prochaine ouverture"
+        SondeFin(d, "sonde du scan complet interrompue (HV fermé) : elle reprendra à ta prochaine visite.")
+    elseif event == "REPLICATE_ITEM_LIST_UPDATE" then
+        sondeFrame:UnregisterEvent("REPLICATE_ITEM_LIST_UPDATE") -- une seule réponse lue
+        d.reponse = GetTime() - sonde.t0
+        local ok, n = pcall(C_AuctionHouse.GetNumReplicateItems)
+        if not ok or not n then
+            d.etat, d.version, d.fait = "réponse sans nombre d'annonces", SONDE_VERSION, true
+            SondeFin(d, "sonde du scan complet : réponse reçue, mais le jeu ne donne pas le nombre d'annonces.")
+            return
+        end
+        SondeLire(n, sonde.token)
+    end
+end)
+
+local function StartSonde()
+    local d = SondeDB()
+    if d.fait and d.version == SONDE_VERSION then return end
+    if sonde or scanRunning or detailRunning then return end
+    if not (AuctionHouseFrame and AuctionHouseFrame:IsShown()) then return end
+    d.date = date("%d/%m %H:%M")
+    if not (C_AuctionHouse and C_AuctionHouse.ReplicateItems and C_AuctionHouse.GetNumReplicateItems
+        and C_AuctionHouse.GetReplicateItemInfo) then
+        d.etat, d.version, d.fait = "fonction absente sur Forever", SONDE_VERSION, true
+        return
+    end
+    sondeToken = sondeToken + 1
+    sonde = { t0 = GetTime(), token = sondeToken }
+    ns._sondeEnCours = true
+    pcall(sondeFrame.RegisterEvent, sondeFrame, "REPLICATE_ITEM_LIST_UPDATE")
+    pcall(sondeFrame.RegisterEvent, sondeFrame, "AUCTION_HOUSE_CLOSED")
+    SetStatus("Sonde du scan complet : en attente du serveur…", "Sonde…")
+    local ok, err = pcall(C_AuctionHouse.ReplicateItems)
+    if not ok then
+        sondeToken = sondeToken + 1
+        d.etat, d.erreur, d.version, d.fait = "erreur à l'appel", tostring(err), SONDE_VERSION, true
+        SondeFin(d, "sonde du scan complet : le jeu a refusé la demande.")
+        return
+    end
+    local token = sondeToken
+    C_Timer.After(SONDE_TIMEOUT, function()
+        if not sonde or sonde.token ~= token or d.reponse then return end
+        sondeToken = sondeToken + 1
+        d.etat, d.version, d.fait = "pas de réponse en " .. SONDE_TIMEOUT .. " s", SONDE_VERSION, true
+        SondeFin(d, "sonde du scan complet : aucune réponse du serveur en " .. SONDE_TIMEOUT .. " s.")
+    end)
+end
+
+---------------------------------------------------------------------------
 -- Événements
 ---------------------------------------------------------------------------
 local frame = CreateFrame("Frame")
 frame:SetScript("OnEvent", function(_, event, ...)
     if event == "AUCTION_HOUSE_SHOW" then
+        C_Timer.After(1, StartSonde) -- sonde du scan complet (une seule fois)
         C_Timer.After(3, StartStudyOnly) -- reprise de l'étude du marché, sans scan
         -- Petit délai : la fenêtre de l'HV de Blizzard est créée au même moment.
         C_Timer.After(0, function()
@@ -2455,21 +2905,15 @@ local ICON_PNJ = "Interface\\MoneyFrame\\UI-SilverIcon" -- pièce d'argent (choi
 local ICON_HV = "Interface\\Minimap\\Tracking\\Auctioneer"
 local ICON_ROUGE = "Interface\\Common\\Indicator-Red" -- pastille rouge sous la pièce « marchand »
 
--- Prix HV d'un objet, gardé en mémoire 5 minutes (bug : gels en vidant la boîte aux lettres,
--- chaque objet récupéré relançait le calcul de toutes les icônes avec la recherche « par lien »
--- d'Auctionator, lente). On demande d'abord par numéro d'objet (rapide).
+-- Prix HV d'un objet, gardé en mémoire 5 minutes (bug : gels en vidant la boîte aux lettres, chaque objet
+-- récupéré relançait le calcul de toutes les icônes). Prix commun ns.PrixHV (notre scan, sinon TSM) :
+-- plus d'Auctionator (règle de Jérémie, 08/11).
 local priceCache, priceCacheTime = {}, 0
 local function AuctionPrice(link, itemID)
-    if not (Auctionator and Auctionator.API and Auctionator.API.v1) then return nil end
     if GetTime() - priceCacheTime > 300 then priceCache, priceCacheTime = {}, GetTime() end
     local cached = priceCache[itemID]
     if cached ~= nil then return cached or nil end
-    local api = Auctionator.API.v1
-    local ok, price = pcall(api.GetAuctionPriceByItemID, "EryAddon", itemID)
-    if not (ok and price) then
-        ok, price = pcall(api.GetAuctionPriceByItemLink, "EryAddon", link)
-    end
-    price = ok and price or nil
+    local price = ns.PrixHV and ns.PrixHV(itemID)
     priceCache[itemID] = price or false
     return price
 end
@@ -2489,6 +2933,7 @@ local function Verdict(link, itemID, count)
     end
     return nil, vendorTotal, hvNet -- trop proche pour conseiller
 end
+ns.BagVerdict = Verdict -- pastilles de l'écran Vendre (EryAddon_Fenetre.lua)
 
 -- Infos de l'objet d'un bouton de sac : lien, numéro, quantité ; nil si vide ou lié.
 local function ButtonItem(button)

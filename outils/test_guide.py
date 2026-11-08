@@ -61,7 +61,7 @@ for f in ["EryAddon.lua", "EryAddon_Theme.lua", "EryAddon_HV.lua", "EryAddon_Rec
 # Recettes connues d'office (source vide) + celles du maître déjà sous le niveau actuel pour l'alchimie.
 L.execute('''
 for _, r in ipairs(...) do
-  if r[5] == "" then KNOWN[r[2]] = true end
+  if r[5] == "" and (r[7] or 0) == 0 then KNOWN[r[2]] = true end
 end''', ns.RECETTES)
 
 def money(c):
@@ -209,10 +209,16 @@ for _, id in ipairs(ns.MarketItems()) do
   if r and #o < 40 then o[#o + 1] = string.format("%s %d", (ns.METIERS[r[1]] or "?"):sub(1, 4), r[4]) end
 end
 ORDRE = table.concat(o, ", ")
+-- Recette à objet-recette mais sans source (Élixir de robustesse, sort 1250783) : PAS connue d'office.
+ROBUST = "absente"
+for _, e in ipairs(ns._Compute(171, 150)) do
+  if e.spell == 1250783 then ROBUST = string.format("connue=%s, à apprendre : %s", tostring(e.known), tostring(e.learnLabel)) end
+end
 ''', ns)
 print(L.globals().MARCHE)
 print("objets à étudier :", L.globals().ITEMS)
 print("ordre (métier, niveau d'apprentissage) :", L.globals().ORDRE)
+print("Élixir de robustesse (attendu connue=false) :", L.globals().ROBUST)
 
 # ESSAI TOUS LES MÉTIERS : route du niveau 1 au niveau 75 (métiers pas appris), bilan de chacun.
 for prof, name in [(164, "Forge"), (165, "Travail du cuir"), (202, "Ingénierie"), (333, "Enchantement"),
@@ -367,3 +373,57 @@ MV_RES = string.format("vendus %d (2), net %d (950), délai %.0f h (3 en jeu ; -
   s.vendus, s.net, s.delaiMoyen or -1, s.enCours, tostring(s.coutConnu))
 ''', ns)
 print("mes ventes :", L.globals().MV_RES)
+
+# ESSAI BESOIN GLOBAL (fiche Métiers, bug des Boulons, 08/11) : un objet demandé directement ET pour fabriquer
+# un autre composant n'est compté qu'une fois dans le stock. Vraies recettes : Boulons de cuivre (3922) =
+# 1 Barre de cuivre (2840) ; Barre (fonte 2657) = 1 Minerai de cuivre (2770) ; Modulateur en cuivre (3926) =
+# 2 Boulons + 1 Barre + 2 Étoffe de lin (2589) ; Dragon mécanique en cuivre (3928) = Modulateur + Boulon +
+# Barre + 2 Malachite (774).
+L.execute('''
+local ns = ...
+local STOCK = {}
+ns.Owned = function(id) return STOCK[id] or 0, 0 end
+EryAddonDB.hvPrix = { t = time(), prix = { [2840] = 10, [4359] = 100, [2770] = 1000, [2589] = 5, [774] = 50, [4363] = 100000 } }
+EryAddonDB.prixMarchand = {}
+KNOWN[3922], KNOWN[3926] = true, true
+local function Fiche(reag)
+  local list, n, why, info = ns._Needs({ color = "easy", known = true, reag = reag, name = "Objet X", prof = 202 })
+  local rows, buys = {}, {}
+  for _, l in ipairs(list) do
+    rows[#rows + 1] = string.format("%s%s %d/%d manque %d%s", l.indent and string.rep("  ", l.indent) or "",
+      tostring(l.name), l.have, l.need, l.missing, l.buy and (" -> acheter " .. l.buy.need) or "")
+    if l.buy then buys[l.id] = l.buy.need end
+  end
+  return list, buys, table.concat(rows, " | "), info.etapes
+end
+local out = {}
+-- 1) Cas du bug : X = 2 Boulons + 3 Barres, stock 3 Barres → 5 Barres au total, il en manque 2.
+STOCK = { [2840] = 3 }
+local list, buys, rows, steps = Fiche("4359:2,2840:3")
+local bar
+for _, l in ipairs(list) do if l.id == 2840 then bar = l end end
+out[#out + 1] = string.format("cas 1 : Barres il faut %d (5), manque %d (2), à acheter %s (2) => %s",
+  bar.need, bar.missing, tostring(buys[2840]), (bar.need == 5 and bar.missing == 2 and buys[2840] == 2) and "OK" or "FAUX")
+out[#out + 1] = "    " .. rows
+out[#out + 1] = "    " .. steps
+-- 2) Même cas avec 1 Boulon déjà dans les sacs : 1 Boulon à fabriquer → 4 Barres, il en manque 1.
+STOCK = { [2840] = 3, [4359] = 1 }
+list, buys = Fiche("4359:2,2840:3")
+for _, l in ipairs(list) do if l.id == 2840 then bar = l end end
+out[#out + 1] = string.format("cas 2 : Barres il faut %d (4), manque %d (1) => %s", bar.need, bar.missing,
+  (bar.need == 4 and bar.missing == 1) and "OK" or "FAUX")
+-- 3) Trois étages : Dragon mécanique ; Barres fondues (minerai pas cher) ; stock 3 Barres.
+--    Modulateur 1 → 2 Boulons ; Boulons 1 + 2 = 3 → 3 Barres ; Barres 1 + 1 + 3 = 5, il en manque 2 → 2 Minerais.
+EryAddonDB.hvPrix.prix[2770] = 2
+STOCK = { [2840] = 3 }
+list, buys, rows, steps = Fiche("4363:1,4359:1,2840:1,774:2")
+local need = {}
+for _, l in ipairs(list) do need[l.id] = l.need end
+out[#out + 1] = string.format("cas 3 : Boulons %s (3), Barres %s (5), Minerai %s (2), Lin %s (2) => %s",
+  tostring(need[4359]), tostring(need[2840]), tostring(need[2770]), tostring(need[2589]),
+  (need[4359] == 3 and need[2840] == 5 and need[2770] == 2 and need[2589] == 2 and buys[2770] == 2) and "OK" or "FAUX")
+out[#out + 1] = "    " .. rows
+out[#out + 1] = "    " .. steps
+BESOINS = table.concat(out, "\\n")
+''', ns)
+print("besoin global :\n" + L.globals().BESOINS)

@@ -32,12 +32,53 @@ end
 Holo.Tex = Tex
 
 -- Cadre d'un pixel autour d'un frame.
+-- Les traits sont gardés en mémoire (lines) : dans une fenêtre RÉDUITE (nouvelle fenêtre de l'HV, fenêtre K à
+-- 80 %), un trait d'1 unité tombe parfois entre deux pixels de l'écran et disparaît (cadre de l'onglet
+-- « Secours. » sans son bord droit, 08/11). Holo.FixBorders les remet à au moins 1 vrai pixel.
+local lines = setmetatable({}, { __mode = "k" }) -- [trait] = "h" (horizontal) ou "v" (vertical)
 function Holo.Border(f, c, a, layer)
     local top = Tex(f, layer or "BORDER", c, a); top:SetPoint("TOPLEFT"); top:SetPoint("TOPRIGHT"); top:SetHeight(1)
     local bot = Tex(f, layer or "BORDER", c, a); bot:SetPoint("BOTTOMLEFT"); bot:SetPoint("BOTTOMRIGHT"); bot:SetHeight(1)
     local lef = Tex(f, layer or "BORDER", c, a); lef:SetPoint("TOPLEFT"); lef:SetPoint("BOTTOMLEFT"); lef:SetWidth(1)
     local rig = Tex(f, layer or "BORDER", c, a); rig:SetPoint("TOPRIGHT"); rig:SetPoint("BOTTOMRIGHT"); rig:SetWidth(1)
+    lines[top], lines[bot], lines[lef], lines[rig] = "h", "h", "v", "v"
     return { top, bot, lef, rig }
+end
+
+-- Remet à au moins 1 pixel réel les traits de cadre de la fenêtre « root » (après un changement d'échelle).
+-- PixelUtil.GetNearestPixelSize : fonction du jeu (taille en unités qui tombe pile sur des pixels entiers).
+-- SEULEMENT sous « root », et jamais à une échelle minuscule (bug 08/11 : nos cadres DANS la fenêtre de l'HV du
+-- jeu, réduite à 0,001 par la nouvelle fenêtre, avaient pris des traits de ~1000 de large → énormes bandes cyan
+-- en revenant à l'interface du jeu).
+local function IsUnder(region, root)
+    local p = region:GetParent()
+    for _ = 1, 30 do
+        if not p then return false end
+        if p == root then return true end
+        p = p:GetParent()
+    end
+    return false
+end
+
+function Holo.FixBorders(root)
+    if not (root and PixelUtil and PixelUtil.GetNearestPixelSize) then return end
+    for t, dir in pairs(lines) do
+        if IsUnder(t, root) then
+            local ok, scale = pcall(t.GetEffectiveScale, t)
+            local size = 1
+            if ok and scale and scale >= 0.3 then size = math.min(4, PixelUtil.GetNearestPixelSize(1, scale, 1)) end
+            if dir == "h" then t:SetHeight(size) else t:SetWidth(size) end
+        end
+    end
+end
+
+-- Remet tous les traits à 1 (réparation après le bug ci-dessus, appelée quand la fenêtre du jeu revient).
+function Holo.ResetBorders(root)
+    for t, dir in pairs(lines) do
+        if not root or IsUnder(t, root) then
+            if dir == "h" then t:SetHeight(1) else t:SetWidth(1) end
+        end
+    end
 end
 
 -- Coins en équerre cyan (2 px d'épaisseur, 10 px de long).

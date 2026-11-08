@@ -25,6 +25,7 @@ local features = {}
 local DEFAULTS = {
     efficacite = true,
     procBarrage = true,
+    deflagration = true,
 }
 
 -- Partagé avec EryAddon_HV.lua (hôtel des ventes).
@@ -32,6 +33,50 @@ ns.features = features
 ns.DEFAULTS = DEFAULTS
 ns.Msg = Msg
 ns.issecret = issecret
+
+-- Chiffres de TSM (TradeSkillMaster + son application, 08/11 : Forever pris en charge, vérifié avec
+-- Jérémie) : « DBMinBuyout » (prix le plus bas, cliché de l'HV toutes les heures), « DBMarket » (prix du
+-- marché lissé), « DBRegionSaleAvg » (prix de vente moyen réel), « DBRegionSoldPerDay » (ventes par jour
+-- et par HV), « DBRegionSaleRate » (part des annonces vendues, 0 à 1), « DBNumAuctions ». Prix en cuivre.
+-- nil si TSM n'est pas chargé ou n'a rien pour cet objet. Gardé 60 s (appelé très souvent par Métiers).
+local tsmCache, tsmCacheTime = {}, 0
+local TSM_SCALED = { DBRegionSaleRate = 1000, DBRegionSoldPerDay = 1000 }
+
+-- PRIX HV d'un objet (cuivre), le même partout (sacs, Métiers, récompense de quête, écran Vendre), SANS
+-- Auctionator (règle de Jérémie, 08/11 : aucune dépendance à Auctionator, qui finira par être retiré ; TSM,
+-- lui, reste) : notre scan s'il a moins d'1 h ; sinon le prix le plus bas de TSM (cliché horaire de tout l'HV) ;
+-- sinon le DERNIER PRIX VU par nos scans (EryAddonDB.hvVu, comme la base de prix d'Auctionator), sinon notre
+-- dernier scan. nil si rien. PAS le « prix du marché » de TSM pour un objet absent de l'HV : comparé aux prix
+-- d'Auctionator sur 4 360 objets (08/11), c'était la cause des plus gros écarts (1 po → 80 po).
+function ns.PrixHV(itemID)
+    if not itemID then return nil end
+    local scan = EryAddonDB and EryAddonDB.hvPrix
+    local p = scan and scan.prix
+    local mine = p and p[itemID]
+    if mine and scan.t and time() - scan.t < 3600 then return mine end
+    local tsm = ns.TSM and ns.TSM("DBMinBuyout", itemID)
+    if tsm and tsm > 0 then return tsm end
+    local seen = EryAddonDB and EryAddonDB.hvVu and EryAddonDB.hvVu[itemID]
+    if type(seen) == "table" and seen.p then return seen.p end
+    return mine
+end
+function ns.TSM(source, itemID)
+    if not itemID or type(TSM_API) ~= "table" or not TSM_API.GetCustomPriceValue then return nil end
+    local now = GetTime()
+    if now - tsmCacheTime > 60 then tsmCache, tsmCacheTime = {}, now end
+    local key = source .. ":" .. itemID
+    local v = tsmCache[key]
+    if v == nil then
+        -- TSM ARRONDIT à l'entier tout ce que renvoie son API (vu dans son code, Object.lua : floor(x + 0.5)) :
+        -- une part d'annonces vendues de 0,63 devenait « 1 » (100 %), 0,4 vente par jour devenait 0. Pour ces
+        -- deux chiffres, on demande la valeur x 1000 et on divise.
+        local scale = TSM_SCALED[source]
+        local ok, r = pcall(TSM_API.GetCustomPriceValue, scale and (source .. "*" .. scale) or source, "i:" .. itemID)
+        v = (ok and type(r) == "number") and (scale and r / scale or r) or false
+        tsmCache[key] = v
+    end
+    return v or nil
+end
 
 -- Maj+clic sur un objet (ou une recette) dans une fenêtre d'EryAddon = son lien dans le chat, comme
 -- dans les fenêtres du jeu (demande de Jérémie). Renvoie vrai si Maj était enfoncée : le clic ne doit
@@ -568,6 +613,214 @@ function Barrage.Disable()
 end
 
 ---------------------------------------------------------------------------
+-- Fonction : DÉFLAGRATION DES ARCANES, charges et temps restant au centre de l'écran (demande de
+-- Jérémie, 08/11 : l'affichage de Blizzard ne donne ni les charges ni le temps).
+-- Le debuff n'est PAS lisible en combat sur Forever : on COMPTE les lancers du sort (méthode de
+-- l'add-on MageTricks). Règle du jeu (texte du sort) : « Effet cumulable jusqu'à 4 fois. Dure 18 sec à
+-- partir de la première application » : la durée ne se rallonge pas, aucun autre sort ne retire les
+-- charges. (MageTricks compte 15 s : 3 s trop tôt.) La durée est relue dans le texte du sort, hors combat.
+-- Hors combat, si le debuff est lisible, il sert à se recaler (après un /reload par exemple).
+---------------------------------------------------------------------------
+local Defla = {
+    key = "deflagration",
+    label = "Déflagration des arcanes : charges et temps au centre de l'écran",
+}
+table.insert(features, Defla)
+
+local DEFLA_SPELL = 400574           -- Déflagration des arcanes (sort lancé)
+local DEFLA_AURAS = { 36032, 400574 } -- debuff de charges (numéro vu dans MageTricks), et secours
+local DEFLA_MAX = 4
+local DEFLA_COUNTDOWN = 5 -- la barre rouge monte pendant les 5 s qui précèdent le GO
+local DEFLA_BAR_W = 8
+local deflaDuration = 18
+local defla = { start = nil, count = 0 }
+local deflaFrame
+local DeflaRefresh
+
+-- Temps d'incantation ACTUEL de Déflagration des arcanes (s), seuil du vert (demande de Jérémie : « le
+-- temps de cast, ça dépend de la hâte ») : 1. lu dans le jeu (C_Spell.GetSpellInfo().castTime, en ms,
+-- hâte comprise) quand il est lisible ; 2. sinon (masqué en combat ?) la durée MESURÉE du dernier lancer
+-- (début → fin, UNIT_SPELLCAST_START / SUCCEEDED) ; 3. sinon la dernière valeur connue.
+local deflaCast = 2.5
+local deflaCastStart
+local function DeflaCastTime()
+    if C_Spell and C_Spell.GetSpellInfo then
+        local ok, info = pcall(C_Spell.GetSpellInfo, DEFLA_SPELL)
+        if ok and type(info) == "table" and not (issecrettable and issecrettable(info))
+            and not issecret(info.castTime) and (tonumber(info.castTime) or 0) > 0 then
+            deflaCast = info.castTime / 1000
+        end
+    end
+    return deflaCast
+end
+
+local function DeflaReadSpell()
+    if InCombatLockdown() or not (C_Spell and C_Spell.GetSpellDescription) then return end
+    local ok, desc = pcall(C_Spell.GetSpellDescription, DEFLA_SPELL)
+    if not ok or type(desc) ~= "string" or issecret(desc) then return end
+    local d = desc:gsub("\194\160", " "):match("Dure (%d+) sec")
+    if tonumber(d) then deflaDuration = tonumber(d) end
+end
+
+local function DeflaCreate()
+    if deflaFrame then return end
+    local f = CreateFrame("Frame", "EryDeflagration", UIParent)
+    f:SetSize(52, 52)
+    f:SetPoint("CENTER", UIParent, "CENTER", 0, -140) -- au milieu, un peu sous le personnage
+    f:SetFrameStrata("HIGH")
+    f.icon = f:CreateTexture(nil, "ARTWORK")
+    f.icon:SetAllPoints()
+    f.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    local tex = C_Spell and C_Spell.GetSpellTexture and C_Spell.GetSpellTexture(DEFLA_SPELL)
+    f.icon:SetTexture((not issecret(tex) and tex) or 135735)
+    -- Cercle qui se vide pendant les 18 s.
+    f.cd = CreateFrame("Cooldown", nil, f, "CooldownFrameTemplate")
+    f.cd:SetAllPoints()
+    if f.cd.SetHideCountdownNumbers then f.cd:SetHideCountdownNumbers(true) end
+    if f.cd.SetDrawEdge then f.cd:SetDrawEdge(false) end
+    -- Charges en ÉNORME au centre de l'icône (demande de Jérémie : 2 x la taille du temps essayé avant,
+    -- qui était en 20) ; pas de chiffre du temps : le cercle qui se vide suffit.
+    -- Le chiffre est posé sur un calque AU-DESSUS du cercle : sinon l'ombre du cercle le recouvre en partie
+    -- et assombrit sa couleur (retour de Jérémie : « un truc qui cloche avec les couleurs »).
+    local top = CreateFrame("Frame", nil, f)
+    top:SetAllPoints()
+    top:SetFrameLevel(f.cd:GetFrameLevel() + 2)
+    -- (Icône entière en vert au GO : essayée puis RETIRÉE, « ça rend pas bien ». Seule la barre passe au vert.)
+    f.count = top:CreateFontString(nil, "OVERLAY")
+    f.count:SetFont("Fonts\\ARIALN.TTF", 40, "THICKOUTLINE")
+    f.count:SetPoint("CENTER", f, "CENTER", 0, 0)
+    -- Compte à rebours jusqu'au GO : barre verticale à droite de l'icône (même hauteur), vide jusqu'à
+    -- 5 s avant le GO, puis monte en ROUGE ; pleine au GO, et alors VERTE avec l'icône.
+    f.bar = CreateFrame("Frame", nil, f)
+    f.bar:SetSize(DEFLA_BAR_W, 52)
+    f.bar:SetPoint("LEFT", f, "RIGHT", 4, 0)
+    local bg = f.bar:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints()
+    bg:SetColorTexture(0, 0, 0, 0.6)
+    f.bar.fill = f.bar:CreateTexture(nil, "ARTWORK")
+    f.bar.fill:SetPoint("BOTTOMLEFT")
+    f.bar.fill:SetPoint("BOTTOMRIGHT")
+    f.bar.fill:SetHeight(1)
+    f.bar.fill:Hide()
+    -- Mise à jour à chaque image (la barre doit monter sans à-coups).
+    f:SetScript("OnUpdate", function() DeflaRefresh() end)
+    f:Hide()
+    deflaFrame = f
+end
+
+DeflaRefresh = function()
+    if not deflaFrame then return end
+    local left = defla.start and (defla.start + deflaDuration - GetTime())
+    if not left or left <= 0 or defla.count < 1 then
+        defla.start, defla.count = nil, 0
+        deflaFrame:Hide()
+        return
+    end
+    deflaFrame.count:SetText(defla.count)
+    -- Couleurs des charges = celles d'OmniCC par défaut (demande de Jérémie ; valeurs de mémoire, OmniCC
+    -- n'est pas installé) dans l'ordre de gravité : 1 gris (« heures »), 2 blanc (« minutes »),
+    -- 3 jaune (« secondes »), 4 ROUGE (« bientôt fini », obligatoire).
+    local OMNICC = { { 0.7, 0.7, 0.7 }, { 1, 1, 1 }, { 1, 1, 0.1 }, { 1, 0.1, 0.1 } }
+    local c = OMNICC[math.min(DEFLA_MAX, defla.count)]
+    deflaFrame.count:SetTextColor(c[1], c[2], c[3])
+    -- GO = il reste moins qu'un temps d'incantation de Déflagration (hâte comprise). Sens (Jérémie) : c'est
+    -- LE BON MOMENT pour relancer : le sort finira après la fin des charges, donc il les remet à zéro
+    -- (1 charge, mana normal) au lieu de s'ajouter à 4 charges qui coûtent cher.
+    local cast = DeflaCastTime()
+    local go = left < cast
+    -- Barre : vide à « GO + 5 s », pleine au GO.
+    local frac = go and 1 or math.max(0, math.min(1, 1 - (left - cast) / DEFLA_COUNTDOWN))
+    local fill = deflaFrame.bar.fill
+    deflaFrame.bar:SetShown(frac > 0) -- barre vide : cachée en entier (fond compris), demande de Jérémie
+    if frac > 0 then
+        fill:SetHeight(math.max(1, 52 * frac))
+        if go then fill:SetColorTexture(0, 1, 0, 1) else fill:SetColorTexture(1, 0.1, 0.1, 1) end
+        fill:Show()
+    else
+        fill:Hide()
+    end
+    -- (Chiffre du temps RETIRÉ à la demande de Jérémie, 08/11 : le cercle qui se vide suffit.)
+    deflaFrame:Show()
+end
+
+local function DeflaStart(start, count)
+    defla.start, defla.count = start, count
+    if deflaFrame then deflaFrame.cd:SetCooldown(start, deflaDuration) end
+    DeflaRefresh()
+end
+
+-- Un lancer de Déflagration des arcanes : +1 charge (4 au plus) ; le temps part du PREMIER lancer.
+local function DeflaOnCast()
+    local now = GetTime()
+    if not defla.start or now >= defla.start + deflaDuration then
+        DeflaStart(now, 1)
+    else
+        defla.count = math.min(DEFLA_MAX, defla.count + 1)
+        DeflaRefresh()
+    end
+end
+
+-- Hors combat : le debuff lisible recale le compteur (charges et temps exacts).
+local function DeflaFromAura()
+    if InCombatLockdown() or not (C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID) then return end
+    for _, id in ipairs(DEFLA_AURAS) do
+        local ok, a = pcall(C_UnitAuras.GetPlayerAuraBySpellID, id)
+        if ok and type(a) == "table" and not (issecrettable and issecrettable(a))
+            and not AnySecret(a.applications, a.expirationTime, a.duration)
+            and (a.expirationTime or 0) > 0 and (a.duration or 0) > 0 then
+            deflaDuration = a.duration
+            DeflaStart(a.expirationTime - a.duration, math.max(1, math.min(DEFLA_MAX, a.applications or 1)))
+            return
+        end
+    end
+end
+
+local deflaEvents = CreateFrame("Frame")
+deflaEvents:SetScript("OnEvent", function(_, event, unit, _, spellID)
+    if event == "UNIT_SPELLCAST_START" then
+        if unit == "player" and not issecret(spellID) and spellID == DEFLA_SPELL then deflaCastStart = GetTime() end
+    elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
+        if unit == "player" and not issecret(spellID) and spellID == DEFLA_SPELL then
+            -- Durée réelle de ce lancer (hâte du moment comprise), gardée comme seuil de secours.
+            local d = deflaCastStart and (GetTime() - deflaCastStart)
+            if d and d > 0.3 and d < 6 then deflaCast = d end
+            deflaCastStart = nil
+            DeflaOnCast()
+        end
+    elseif event == "UNIT_AURA" then
+        DeflaFromAura()
+    elseif event == "PLAYER_DEAD" then
+        defla.start, defla.count = nil, 0
+        DeflaRefresh()
+    elseif event == "SPELLS_CHANGED" or event == "PLAYER_REGEN_ENABLED" then
+        DeflaReadSpell()
+    end
+end)
+
+function Defla.Enable(fromPanel)
+    DeflaCreate()
+    DeflaReadSpell()
+    for _, ev in ipairs({ "UNIT_SPELLCAST_START", "UNIT_SPELLCAST_SUCCEEDED" }) do
+        if not pcall(deflaEvents.RegisterUnitEvent, deflaEvents, ev, "player") then
+            pcall(deflaEvents.RegisterEvent, deflaEvents, ev)
+        end
+    end
+    pcall(deflaEvents.RegisterUnitEvent, deflaEvents, "UNIT_AURA", "player")
+    for _, ev in ipairs({ "PLAYER_DEAD", "SPELLS_CHANGED", "PLAYER_REGEN_ENABLED" }) do
+        pcall(deflaEvents.RegisterEvent, deflaEvents, ev)
+    end
+    DeflaFromAura()
+    -- Case cochée dans le panneau : aperçu de 3 s (4 charges) pour voir où l'icône se place.
+    if fromPanel then DeflaStart(GetTime() - (deflaDuration - 3), DEFLA_MAX) end
+end
+
+function Defla.Disable()
+    deflaEvents:UnregisterAllEvents()
+    defla.start, defla.count = nil, 0
+    if deflaFrame then deflaFrame:Hide() end
+end
+
+---------------------------------------------------------------------------
 -- Panneau des réglages (/eryaddon)
 ---------------------------------------------------------------------------
 local panel
@@ -957,9 +1210,10 @@ local function RewardValue(index)
     local name, _, _, _, _, _, _, _, _, _, sellPrice, _, _, bindType = getInfo(link)
     if not name then return nil end -- infos pas encore chargées
     local value = (sellPrice or 0) * count
-    if bindType ~= 1 and Auctionator and Auctionator.API and Auctionator.API.v1 then
-        local ok, hv = pcall(Auctionator.API.v1.GetAuctionPriceByItemLink, "EryAddon", link)
-        if ok and type(hv) == "number" and hv * count * 0.95 > value then value = hv * count * 0.95 end
+    if bindType ~= 1 and ns.PrixHV then
+        local id = tonumber(link:match("item:(%d+)"))
+        local hv = ns.PrixHV(id)
+        if hv and hv * count * 0.95 > value then value = hv * count * 0.95 end
     end
     return value
 end

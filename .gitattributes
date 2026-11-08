@@ -2,6 +2,7 @@
 *.bat text eol=crlf
 *.ps1 text eol=crlf
 *.ogg binary
+*.tga binary
 # Pas dans le zip téléchargé par les joueurs (outils de Claude, fichiers Git) :
 outils/ export-ignore
 .gitattributes export-ignore

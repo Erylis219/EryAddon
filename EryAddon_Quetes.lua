@@ -10,6 +10,7 @@ local _, ns = ...
 -- Zone du jeu (AreaTable, celle des positions de QuestieDB) -> carte (UiMap). GÉNÉRÉ depuis la table
 -- UiMapAssignment de Forever 1.60.1.70862 (wago.tools), voir outils/zone_map.lua.
 local ZONE_MAP = {[1]=1426, [3]=1418, [4]=1419, [8]=1435, [10]=1431, [11]=1437, [12]=1429, [14]=1411, [15]=1445, [16]=1447, [17]=1413, [28]=1422, [33]=1434, [36]=1416, [38]=1432, [40]=1436, [41]=1430, [44]=1433, [45]=1417, [46]=1428, [47]=1425, [51]=1427, [85]=1420, [130]=1421, [139]=1423, [141]=1438, [148]=1439, [215]=1412, [267]=1424, [331]=1440, [357]=1444, [361]=1448, [400]=1441, [405]=1443, [406]=1442, [440]=1446, [490]=1449, [493]=1450, [616]=2482, [618]=1452, [1377]=1451, [1497]=1458, [1519]=1453, [1537]=1455, [1637]=1454, [1638]=1456, [1657]=1457, [2597]=1459, [3277]=1460, [3358]=1461, [16591]=2548, [16593]=2521, [16606]=2524, [16651]=2652}
+ns.ZONE_MAP = ZONE_MAP -- zone (AreaTable) → carte du jeu : aussi pour « Carte » de l'écran Métiers (EryAddon_Fenetre.lua)
 
 -- Données des quêtes : add-on QuestieDB (installé SÉPARÉMENT de Questie ; il marche seul et
 -- applique ses propres corrections Forever). Si QuestieDB est absent : la fonction ne fait rien.

@@ -53,14 +53,9 @@ local function Objet(itemID)
     return name or ("objet " .. itemID), sell or 0
 end
 
+-- Prix HV commun (EryAddon.lua) : notre scan, sinon TSM. Plus d'Auctionator (règle de Jérémie, 08/11).
 local function PrixHV(itemID)
-    local p = EryAddonDB.hvPrix and EryAddonDB.hvPrix.prix
-    if p and p[itemID] then return p[itemID] end
-    -- Pas vu par notre scan : dernier prix d'Auctionator (ex. Fiole vide : 19 pc à l'HV).
-    if Auctionator and Auctionator.API and Auctionator.API.v1 then
-        local ok, v = pcall(Auctionator.API.v1.GetAuctionPriceByItemID, "EryAddon", itemID)
-        if ok and type(v) == "number" and v > 0 then return v end
-    end
+    return ns.PrixHV and ns.PrixHV(itemID)
 end
 
 -- Coût d'un composant : le moins cher entre l'HV et le marchand.
@@ -99,6 +94,13 @@ local function OtherPriceText(itemID, src, qty)
     end
     other = PrixHV(itemID)
     return other and (" |cff5f8a99(HV " .. Money(other * qty) .. ")|r") or ""
+end
+
+-- Recette apprise d'office avec le métier : SANS source ET SANS objet-recette. (BUG vu le 08/11 : toute
+-- recette « sans source » passait pour connue ; or 282 recettes Forever ont une source vide dans les
+-- données de WhatsTraining mais s'apprennent avec un objet-recette, ex. Élixir de robustesse, objet 250370.)
+local function AutoKnown(r)
+    return (r[5] or "") == "" and (r[7] or 0) == 0
 end
 
 local function IsKnown(spell)
@@ -313,7 +315,7 @@ local function LearnOptions(r)
 end
 
 local function Obtainable(r)
-    if (r[5] or "") == "" then return true end
+    if AutoKnown(r) then return true end
     return LearnOptions(r).best ~= nil
 end
 
@@ -335,6 +337,7 @@ local function LearnLabel(r)
     local src = r[5] or ""
     if src:find("D") then return "recette à trouver sur un monstre, voir info-bulle" end
     if src:find("Q") then return "recette de quête, voir info-bulle" end
+    if (r[7] or 0) > 0 then return "recette " .. Objet(r[7]) .. " (source inconnue, voir info-bulle)" end
     return "?"
 end
 
@@ -560,12 +563,17 @@ local function CraftUnitCost(itemID)
     return total / qty, spell
 end
 
--- Ce que vaut une unité de cet objet pour toi (suivi de tes ventes, EryAddon_HV.lua) : prix de ses
--- composants si tu sais le fabriquer, sinon le prix d'achat le plus bas (HV ou marchand).
+-- Ce qu'une unité de cet objet t'a COÛTÉ (Mes ventes, écran Vendre), et d'où vient ce coût :
+--   « acheté »  = prix réellement payé (achat noté par EryAddon, 14 jours) ;
+--   « fabriqué » = prix de ses composants (tu sais le fabriquer) ;
+--   « ramassé » = 0. JAMAIS le prix du marché (règle de Jérémie, 08/11 : « imagine j'ai looté ces cuirs dans la
+--   nature » ; avant, un objet ramassé prenait le prix de l'HV comme coût → fausses pertes).
 function ns.CostBasis(itemID)
+    local paid = EryAddonDB.prixPaye and EryAddonDB.prixPaye[itemID]
+    if type(paid) == "table" and paid.unit and paid.t and time() - paid.t < 14 * 86400 then return paid.unit, "acheté" end
     local craft = CraftUnitCost(itemID)
-    if craft then return craft end
-    return (UnitCost(itemID))
+    if craft then return math.floor(craft + 0.5), "fabriqué" end
+    return 0, "ramassé"
 end
 
 
@@ -578,13 +586,19 @@ local function BestCost(itemID)
 end
 
 -- Toutes les recettes d'un métier jusqu'au niveau donné, chiffrées.
-local function Compute(profID, skill)
+-- onlySpell : une seule recette, même au-dessus de ton niveau (recherche d'objet de la nouvelle fenêtre).
+local function Compute(profID, skill, onlySpell)
     local list = {}
     local db = EryAddonDB.metiers and EryAddonDB.metiers.recettes
     if not db then return list end
     for _, r in ipairs(ns.RECETTES) do
         local prof, spell, learn = r[1], r[2], r[4]
-        local data = prof == profID and learn <= skill and db[spell]
+        local data
+        if onlySpell then
+            data = spell == onlySpell and db[spell]
+        else
+            data = prof == profID and learn <= skill and db[spell]
+        end
         -- Recette ni connue ni accessible (butin, quête) : pas proposée.
         -- (Les recettes de butin ou de quête restent affichées, marquées, avec leurs sources
         -- dans l'info-bulle : demande de Jérémie, « il faut que j'aie les données sous les yeux ».)
@@ -592,7 +606,7 @@ local function Compute(profID, skill)
             local _, out, qmin, qmax, reag = data:match("^(%d+)|(%d+)|(%d+)|(%d+)|(.*)$")
             out, qmin, qmax = tonumber(out), tonumber(qmin), tonumber(qmax)
             local qty = (qmin + qmax) / 2
-            local known = IsKnown(spell) or r[5] == ""
+            local known = IsKnown(spell) or AutoKnown(r)
             local color, chance, estimated, y, g, gr, exact = ColorAndChance(spell, learn, skill)
 
             local cost, details = 0, {}
@@ -615,9 +629,8 @@ local function Compute(profID, skill)
 
             local name, sell = Objet(out)
             local hv = PrixHV(out)
-            -- Marché mort (étude du marché : aucune vente depuis 12 h ou plus) : pas de vente à l'HV.
-            local st = ns.MarketState and ns.MarketState(out)
-            if st and st.etat == "mort" then hv = nil end
+            -- Marché mort (TSM, sinon étude du marché) : pas de vente à l'HV.
+            if ns.MarketDead and ns.MarketDead(out) then hv = nil end
             local saleHV = hv and hv * qty * (1 - COMMISSION)
             local saleVendor = (sell or 0) * qty
             local sale, saleSrc = saleVendor, "marchand"
@@ -1024,8 +1037,102 @@ local function PriceLine(id, missing, buy, src)
     return Money(buy * missing) .. " |cff5f8a99" .. src .. "|r" .. OtherPriceText(id, src, missing)
 end
 
-local function Needs(e)
+-- Besoin GLOBAL d'une recette, remonté jusqu'aux composants de base. BUG signalé par un ami de
+-- Jérémie (08/11) : recette = Boulons + Barres de cuivre, Boulons à fabriquer avec des Barres → les
+-- Barres de tes sacs étaient comptées deux fois (pour la recette ET pour les Boulons), et après avoir
+-- fabriqué les Boulons il n'en restait plus assez. Maintenant : on additionne tous les besoins d'un
+-- même objet (direct + pour les fabrications intermédiaires), on retire ce que tu as (ns.Owned : sacs
+-- + courrier) UNE seule fois, et c'est ce qui reste qu'on fabrique (si c'est moins cher) ou achète.
+-- Renvoie { top = composants de la recette (dans l'ordre), direct[objet] = quantité pour les n
+-- fabrications, gross[objet] = besoin total, make[objet] = fabrications intermédiaires,
+-- craft[objet] = { spell, made, sub = { {id, qty} } }, uses[objet] = { {parent, qty} },
+-- level[objet] = profondeur (pour l'ordre des étapes), have(objet) }.
+local DEMAND_DEPTH = 4
+local function Demand(n, reag)
+    local d = { top = {}, direct = {}, craft = {}, make = {}, gross = {}, uses = {}, level = {} }
+    local haveCache = {}
+    function d.have(id)
+        if not haveCache[id] then haveCache[id] = ItemCount(id) end
+        return haveCache[id]
+    end
+    for id, q in reag:gmatch("(%d+):(%d+)") do
+        id, q = tonumber(id), tonumber(q)
+        if not d.direct[id] then d.top[#d.top + 1] = id end
+        d.direct[id] = (d.direct[id] or 0) + q * n
+    end
+    -- Ce qui se fabrique moins cher que ça ne s'achète (recette connue), sans boucle ni trop de profondeur.
+    local path = {}
+    local function Explore(id, depth)
+        if d.craft[id] ~= nil then return end
+        d.craft[id] = false
+        if depth > DEMAND_DEPTH then return end
+        local c, spell = CraftUnitCost(id)
+        local buy = UnitCost(id)
+        if not c or (buy and c >= buy) then return end
+        local _, made, subReag = RecipeData(spell)
+        if not made or made <= 0 then return end
+        local sub = {}
+        for sid, sq in subReag:gmatch("(%d+):(%d+)") do
+            sid = tonumber(sid)
+            if path[sid] or sid == id then return end -- boucle (A fait B qui fait A) : on achète
+            sub[#sub + 1] = { id = sid, qty = tonumber(sq) }
+        end
+        d.craft[id] = { spell = spell, made = made, sub = sub }
+        path[id] = true
+        for _, s in ipairs(sub) do Explore(s.id, depth + 1) end
+        path[id] = nil
+    end
+    for _, id in ipairs(d.top) do Explore(id, 1) end
+
+    -- Besoins totaux pour un choix de fabrications donné.
+    local function Gross(make)
+        local gross, uses = {}, {}
+        for _, id in ipairs(d.top) do gross[id] = d.direct[id] end
+        for id, k in pairs(make) do
+            for _, s in ipairs(d.craft[id].sub) do
+                gross[s.id] = (gross[s.id] or 0) + s.qty * k
+                uses[s.id] = uses[s.id] or {}
+                table.insert(uses[s.id], { parent = id, qty = s.qty * k })
+            end
+        end
+        return gross, uses
+    end
+    -- Ce qu'il faut fabriquer : le manque (besoin total − ce que tu as) des objets qui se fabriquent
+    -- moins cher. Répété jusqu'à ce que ça ne bouge plus (fabriquer des Boulons augmente le besoin en Barres…).
+    local make = {}
+    local gross, uses = Gross(make)
+    for _ = 1, 10 do
+        local new, same = {}, true
+        for id, g in pairs(gross) do
+            local miss = g - d.have(id)
+            if miss > 0 and d.craft[id] then new[id] = math.ceil(miss / d.craft[id].made - 1e-9) end
+        end
+        for id, k in pairs(new) do if make[id] ~= k then same = false end end
+        for id in pairs(make) do if not new[id] then same = false end end
+        if same then break end
+        make = new
+        gross, uses = Gross(make)
+    end
+    d.make, d.gross, d.uses = make, gross, uses
+    -- Profondeur de chaque objet fabriqué (le plus long chemin depuis la recette).
+    for _, id in ipairs(d.top) do d.level[id] = 0 end
+    for _ = 1, DEMAND_DEPTH + 1 do
+        for id in pairs(make) do
+            for _, s in ipairs(d.craft[id].sub) do
+                local l = (d.level[id] or 0) + 1
+                if not d.level[s.id] or d.level[s.id] < l then d.level[s.id] = l end
+            end
+        end
+    end
+    return d
+end
+ns._Demand = Demand -- (test hors jeu)
+
+-- want : nombre de fabrications choisi par Jérémie (nouvelle fenêtre, « Combien en fabriquer ? ») ; sinon
+-- l'objectif habituel (monter jusqu'au vert).
+local function Needs(e, want)
     local n, why, stop = CraftsPlanned(e)
+    if want and want > 0 then n = want end
     local list = {}
     local info = { maintenant = nil, bloque = nil, apres = n, etapes = "" }
     local achats, fabrications = {}, {}
@@ -1064,47 +1171,54 @@ local function Needs(e)
     end
 
     if e.reag and e.reag ~= "?" and e.reag ~= "" then
-        for id, q in e.reag:gmatch("(%d+):(%d+)") do
-            id, q = tonumber(id), tonumber(q)
-            local need, have = q * n, ItemCount(id)
-            local missing = math.max(0, need - have)
-            local name = Objet(id)
-            -- Fabrications possibles tout de suite : le composant le plus juste décide.
+        local d = Demand(n, e.reag)
+        -- Fabrications possibles tout de suite (sans fabriquer les composants) : le composant le plus juste décide.
+        for _, id in ipairs(d.top) do
+            local q, have = d.direct[id] / n, d.have(id)
             local possible = math.floor(have / q)
             if not info.maintenant or possible < info.maintenant then
                 info.maintenant = possible
-                info.bloque = possible == 0 and string.format("il manque %d %s pour la 1re", q - have, name) or nil
+                info.bloque = possible == 0 and string.format("il manque %d %s pour la 1re", q - have, Objet(id)) or nil
             end
-            local note = MailNote(id)
-            local buy, src = UnitCost(id)
-            local craft, spell = CraftUnitCost(id)
-            if missing > 0 and craft and (not buy or craft < buy) then
-                local _, made, subReag = RecipeData(spell)
-                local toMake = math.ceil(missing / made)
-                list[#list + 1] = { id = id, name = name, per = q, have = have, need = need, missing = missing,
-                    price = string.format("|cff5cffb0à fabriquer : %d fabrication%s (moins cher)|r", toMake,
-                        toMake > 1 and "s" or "") .. (note and ("  |cff5f8a99" .. note .. "|r") or "") }
-                fabrications[#fabrications + 1] = string.format("%d %s", missing, name)
-                for sid, sq in subReag:gmatch("(%d+):(%d+)") do
-                    sid, sq = tonumber(sid), tonumber(sq)
-                    local sneed, shave = sq * toMake, ItemCount(sid)
-                    local smiss = math.max(0, sneed - shave)
-                    local sbuy, ssrc = UnitCost(sid)
-                    list[#list + 1] = {
-                        indent = true, id = sid, name = Objet(sid), per = sq, have = shave, need = sneed, missing = smiss,
-                        price = PriceLine(sid, smiss, sbuy, ssrc),
-                        buy = (smiss > 0 and sbuy) and { kind = "buy", id = sid, need = smiss, have = 0, name = Objet(sid),
-                            unit = sbuy, src = ssrc } or nil,
-                        cost = (smiss > 0 and sbuy) and sbuy * smiss or 0,
-                    }
-                    if smiss > 0 then
-                        if sbuy then achats[#achats + 1] = string.format("%d %s", smiss, Objet(sid)) else info.apres = nil end
+        end
+        -- Une ligne par objet, UNE SEULE FOIS : les composants de la recette, puis sous chaque objet à
+        -- fabriquer ses propres composants en retrait (sauf ceux déjà en ligne : leur ligne compte tout).
+        local shown = {}
+        for _, id in ipairs(d.top) do shown[id] = true end
+        local function Row(id, per, level, parent)
+            local need, have = d.gross[id] or 0, d.have(id)
+            local missing = math.max(0, need - have)
+            local name = Objet(id)
+            -- « dont 2 pour Boulon » : la part de IL FAUT qui sert à fabriquer un autre objet.
+            local parts = {}
+            for _, u in ipairs(d.uses[id] or {}) do
+                if u.parent ~= parent then parts[#parts + 1] = string.format("%d pour %s", u.qty, Objet(u.parent)) end
+            end
+            local notes = {}
+            if parts[1] then notes[#notes + 1] = "dont " .. table.concat(parts, ", ") end
+            local mail = MailNote(id)
+            local k = d.make[id]
+            if k then
+                if mail then notes[#notes + 1] = mail end
+                list[#list + 1] = { id = id, name = name, per = per, have = have, need = need, missing = missing,
+                    indent = level > 0 and level or nil,
+                    price = string.format("|cff5cffb0à fabriquer : %d fabrication%s (moins cher)|r", k, k > 1 and "s" or "")
+                        .. (notes[1] and ("  |cff5f8a99" .. table.concat(notes, " · ") .. "|r") or "") }
+                fabrications[#fabrications + 1] = { level = d.level[id] or 0, text = string.format("%d %s", missing, name) }
+                for _, s in ipairs(d.craft[id].sub) do
+                    if not shown[s.id] then
+                        shown[s.id] = true
+                        Row(s.id, s.qty, level + 1, id)
                     end
                 end
             else
+                if missing == 0 and mail then notes[#notes + 1] = mail end
+                local buy, src = UnitCost(id)
                 list[#list + 1] = {
-                    id = id, name = name, per = q, have = have, need = need, missing = missing,
-                    price = PriceLine(id, missing, buy, src) .. ((missing == 0 and note) and ("  |cff5f8a99" .. note .. "|r") or ""),
+                    id = id, name = name, per = per, have = have, need = need, missing = missing,
+                    indent = level > 0 and level or nil,
+                    price = PriceLine(id, missing, buy, src)
+                        .. (notes[1] and ("  |cff5f8a99" .. table.concat(notes, " · ") .. "|r") or ""),
                     buy = (missing > 0 and buy) and { kind = "buy", id = id, need = missing, have = 0, name = name,
                         unit = buy, src = src } or nil,
                     cost = (missing > 0 and buy) and buy * missing or 0,
@@ -1114,8 +1228,11 @@ local function Needs(e)
                 end
             end
         end
+        for _, id in ipairs(d.top) do Row(id, d.direct[id] / n, 0, nil) end
     end
     info.maintenant = info.maintenant or 0
+    -- Fabrications intermédiaires : les plus profondes d'abord (les Barres avant les Boulons qui en ont besoin).
+    table.sort(fabrications, function(a, b) return a.level > b.level end)
 
     -- Étapes, dans l'ordre : acheter, fabriquer les composants, fabriquer l'objet.
     local steps, k = {}, 0
@@ -1129,7 +1246,7 @@ local function Needs(e)
     end
     for _, f in ipairs(fabrications) do
         k = k + 1
-        steps[#steps + 1] = string.format("%d. Fabrique %s", k, f)
+        steps[#steps + 1] = string.format("%d. Fabrique %s", k, f.text)
     end
     k = k + 1
     steps[#steps + 1] = string.format("%d. Fabrique %d %s", k, n, e.name)
@@ -1147,6 +1264,24 @@ local SalesText
 -- « Se vend : env. 3 par jour à l'HV (12 en vente) », d'après l'écoulement entre deux scans
 -- (EryAddon_HV.lua). En rouge si on en fabriquerait nettement plus que ce qui part en 3 jours.
 SalesText = function(itemID, planned)
+    local function Num(v)
+        return v >= 10 and string.format("%d", math.floor(v + 0.5)) or (string.format("%.1f", v):gsub("%.", ","))
+    end
+    -- TSM d'abord (08/11) : ventes par jour et par HV, part des annonces vendues, annonces en vente.
+    local perDayTSM = ns.TSM and ns.TSM("DBRegionSoldPerDay", itemID)
+    if perDayTSM then
+        local rate = ns.TSM("DBRegionSaleRate", itemID)
+        local listed = ns.TSM("DBNumAuctions", itemID)
+            or (EryAddonDB.hvPrix and EryAddonDB.hvPrix.quantites and EryAddonDB.hvPrix.quantites[itemID])
+        local color = "|cff5cffb0"
+        if perDayTSM < 0.2 then color = "|cffff7373"
+        elseif (planned and planned > perDayTSM * 3) or (rate and rate < 0.2) then color = "|cffff9933" end
+        local extra = {}
+        if rate then extra[#extra + 1] = string.format("%d %% des annonces partent", math.floor(rate * 100 + 0.5)) end
+        if listed then extra[#extra + 1] = string.format("%d en vente", listed) end
+        return string.format("%sSe vend : env. %s par jour|r%s", color, perDayTSM < 0.2 and "0" or Num(perDayTSM),
+            #extra > 0 and (" |cff5f8a99(" .. table.concat(extra, ", ") .. ")|r") or "")
+    end
     -- Étude du marché (annonces suivies une à une) quand on l'a.
     local st = ns.MarketState and ns.MarketState(itemID)
     if st and st.etat ~= "inconnu" then
@@ -1183,6 +1318,48 @@ SalesText = function(itemID, planned)
     return string.format("%sSe vend : env. %s par jour à l'HV|r |cff5f8a99(%d en vente)|r", color,
         perDay < 0.2 and "0" or amount, listed)
 end
+
+-- Les calculs de Métiers, pour l'écran Métiers de la NOUVELLE FENÊTRE (EryAddon_Fenetre.lua) : mêmes
+-- règles, une seule source de vérité.
+local recipeIndex -- [{ name (minuscules), label, r }] : recherche d'un objet à fabriquer
+ns.JobsAPI = {
+    Professions = function() return MyProfessions() end,
+    LevelOf = function(pr) return LevelOf(pr) end,
+    TabLabel = function(pr) return TabLabel(pr) end,
+    Compute = function(profID, skill, onlySpell) return Compute(profID, skill, onlySpell) end,
+    Needs = function(e, want) return Needs(e, want) end,
+    CraftsPlanned = function(e) return CraftsPlanned(e) end,
+    BuyLine = function(l, part) return BuyLine(l, part) end,
+    SalesText = function(itemID, planned) return SalesText(itemID, planned) end,
+    ReuseText = function(e) return ReuseText(e) end,
+    LearnCost = function(e) return EntryLearnCost(e) end,
+    Objet = function(id) return Objet(id) end,
+    -- Recettes dont l'objet fabriqué contient « text » (tous métiers, tous niveaux) : 10 au plus.
+    Find = function(text)
+        text = (text or ""):lower()
+        if #text < 2 then return {} end
+        if not recipeIndex then
+            recipeIndex = {}
+            for _, r in ipairs(ns.RECETTES or {}) do
+                local name = Objet(r[3])
+                if name and not name:find("^objet %d") then
+                    recipeIndex[#recipeIndex + 1] = { name = name:lower(), label = name, r = r }
+                end
+            end
+        end
+        local found = {}
+        for _, x in ipairs(recipeIndex) do
+            if x.name:find(text, 1, true) then found[#found + 1] = x end
+        end
+        table.sort(found, function(a, b)
+            local sa, sb = a.name:sub(1, #text) == text, b.name:sub(1, #text) == text
+            if sa ~= sb then return sa end
+            return #a.name < #b.name
+        end)
+        while #found > 10 do table.remove(found) end
+        return found
+    end,
+}
 
 local function RefreshPanel(p)
     if not p:IsShown() then return end
@@ -1262,8 +1439,9 @@ local function RefreshPanel(p)
     f.title:SetText(e.name)
     f.title:SetTextColor(c[1], c[2], c[3])
     if e.known then
-        f.learn:SetText(string.format("%s · %d %%%s", COLOR_NAME[e.color] or "?", math.floor(e.chance * 100 + 0.5),
-            (e.color == "optimal" and e.multi > 1) and (" · " .. e.multi .. " points") or ""))
+        -- « Recette connue » écrit en clair (demande de Jérémie : « je sais pas si j'ai la recette »).
+        f.learn:SetText(string.format("|cff5cffb0Recette connue|r · %s · %d %%%s", COLOR_NAME[e.color] or "?",
+            math.floor(e.chance * 100 + 0.5), (e.color == "optimal" and e.multi > 1) and (" · " .. e.multi .. " points") or ""))
     else
         f.learn:SetText("|cffff9933À apprendre : " .. (e.learnLabel or "?") .. "|r")
     end
@@ -1319,7 +1497,7 @@ local function RefreshPanel(p)
         local nd = needs[i]
         line.need = nd
         if nd then
-            local indent = nd.indent and 18 or 6
+            local indent = 6 + 12 * (nd.indent or 0) -- (indent = niveau : 1 = composant d'un composant, 2…)
             line.text:SetPoint("TOPLEFT", indent, -2)
             line.price:SetPoint("BOTTOMLEFT", indent, 3)
             line.text:SetText(nd.indent and ("|cffb8d8e6" .. nd.name .. "|r") or nd.name)
@@ -1775,7 +1953,7 @@ local function Candidates(profID, cap)
     for _, r in ipairs(ns.RECETTES) do
         if r[1] == profID and r[4] < cap then
             local spell = r[2]
-            local known = IsKnown(spell) or r[5] == ""
+            local known = IsKnown(spell) or AutoKnown(r)
             local learnCost = known and 0 or LearnCost(r)
             local out, qty, reag = RecipeData(spell)
             if reag and learnCost then
@@ -2245,7 +2423,11 @@ local function DockWindow(win, host)
 end
 
 local function EnsureJobs()
-    if not standalone then standalone = ns.CreateJobsPanel(UIParent) end
+    -- K ouvre maintenant le NOUVEL écran Métiers (EryAddon_Fenetre.lua, demande de Jérémie 08/11), en fenêtre
+    -- à part un peu plus petite ; l'ancien panneau ne sert plus qu'en secours.
+    if not standalone then
+        standalone = (ns.Fenetre and ns.Fenetre.MetiersWindow and ns.Fenetre.MetiersWindow()) or ns.CreateJobsPanel(UIParent)
+    end
     return standalone
 end
 

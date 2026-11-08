@@ -2,7 +2,7 @@
 ## Title: EryAddon
 ## Notes: Hôtel des ventes, métiers et plus (client français). Tapez /eryaddon pour activer ou désactiver chaque fonction.
 ## Author: Jérémie
-## Version: 0.52.0
+## Version: 0.53.0
 ## SavedVariables: EryAddonDB
 ## X-Curse-Project-ID: 1791316
 
@@ -12,4 +12,5 @@ EryAddon_HV.lua
 EryAddon_Recettes.lua
 EryAddon_Metiers.lua
 EryAddon_Jobs.lua
+EryAddon_Fenetre.lua
 EryAddon_Quetes.lua
