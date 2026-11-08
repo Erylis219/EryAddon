@@ -109,9 +109,28 @@ local scanResults, scanToken = {}, 0
 local scanQty = {} -- [objet] = quantité en vente
 local scanKeys, lastScanKeys = {}, {} -- [objet] = clé de recherche vue au scan (pour l'étude du marché)
 local statusText = ""
+-- Version COURTE de l'état (« EDM 71/3711 », « Scan : 1200 objets »), affichée sous les boutons de scan
+-- collés à droite de l'HV (demande de Jérémie). sideStatus = le texte, créé avec les onglets.
+local shortText, sideStatus = "", nil
+-- Scan global (demande de Jérémie : « tout scanner, avant d'aller me coucher, même si ça dure 1 h ») :
+-- scan + étude du marché de TOUS les objets de l'HV, sans la limite de 10 min ni l'âge minimal du relevé.
+local globalMode = false
 
-local function SetStatus(text)
+local function UpdateSide()
+    if not sideStatus then return end
+    local t = shortText
+    if t == "" then
+        local s = EryAddonDB and EryAddonDB.hvScan
+        t = (type(s) == "table" and s.time) and string.format("Dernier scan :\nil y a %d min", math.floor((time() - s.time) / 60))
+            or "Aucun scan"
+    end
+    sideStatus:SetText(t)
+end
+
+local function SetStatus(text, short)
     statusText = text
+    shortText = short or ""
+    UpdateSide()
     if UpdateWindow then UpdateWindow() end
 end
 
@@ -190,7 +209,7 @@ local function FinishScan(missing, attempt)
     end
     if count > 0 and attempt < 3 then
         SortByUnitGain(liveList)
-        SetStatus(string.format("Chargement des infos de %d objets…", count))
+        SetStatus(string.format("Chargement des infos de %d objets…", count), "Scan : fin…")
         C_Timer.After(2, function() FinishScan(still, attempt + 1) end)
         return
     end
@@ -253,7 +272,8 @@ local function NextPage()
     end
     local count = 0
     for _ in pairs(scanResults) do count = count + 1 end
-    SetStatus(string.format("Scan en cours : %d objets lus, %d anomalies…", count, #liveList))
+    SetStatus(string.format("Scan en cours : %d objets lus, %d anomalies…", count, #liveList),
+        string.format("Scan : %d objets", count))
     scanToken = scanToken + 1
     local token = scanToken
     C_AuctionHouse.RequestMoreBrowseResults()
@@ -285,12 +305,12 @@ local function StartScan()
     Saved().items = liveList
     scanToken = scanToken + 1
     local token = scanToken
-    SetStatus("Scan demandé au serveur…")
+    SetStatus("Scan demandé au serveur…", "Scan : envoi…")
     C_AuctionHouse.SendBrowseQuery({ searchString = "", sorts = {}, filters = {}, itemClassFilters = {} })
     C_Timer.After(10, function()
         if scanRunning and token == scanToken then
-            scanRunning = false
-            SetStatus("Le serveur n'a pas répondu. Réessaie dans quelques secondes.")
+            scanRunning, globalMode = false, false
+            SetStatus("Le serveur n'a pas répondu. Réessaie dans quelques secondes.", "Pas de réponse")
         end
     end)
 end
@@ -348,6 +368,35 @@ local function JournalAchat(line)
     local log = EryAddonDB.hvJournal
     log[#log + 1] = line
     while #log > 50 do table.remove(log, 1) end
+end
+
+-- BILAN CUMULÉ des achats d'Anomalies (demande de Jérémie, 08/11) : tout ce qui est acheté ici est
+-- supposé revendu au marchand. EryAddonDB.anoBilan = { n (achats), objets, paye, revente (pc), debut }.
+-- Jamais effacé. 1re fois : reprise de l'historique dans le journal (50 derniers achats, ceux où des
+-- objets ont été reçus).
+local function AnoBilan()
+    local b = EryAddonDB.anoBilan
+    if type(b) == "table" then return b end
+    b = { n = 0, objets = 0, paye = 0, revente = 0 }
+    for _, line in ipairs(EryAddonDB.hvJournal or {}) do
+        local d, recu, paye, marchand = line:match(
+            "^(%d+/%d+) [%d:]+ .-%(id %d+%) : demandé %d+, reçu (%d+), payé (%-?%d+) pc, prix marchand (%d+) pc")
+        recu, paye, marchand = tonumber(recu), tonumber(paye), tonumber(marchand)
+        if recu and recu > 0 and paye and marchand then
+            b.n, b.objets = b.n + 1, b.objets + recu
+            b.paye, b.revente = b.paye + paye, b.revente + marchand * recu
+            b.debut = b.debut or d
+        end
+    end
+    b.debut = b.debut or date("%d/%m")
+    EryAddonDB.anoBilan = b
+    return b
+end
+
+local function AddAnoBilan(received, paid, vendorUnit)
+    local b = AnoBilan()
+    b.n, b.objets = b.n + 1, b.objets + received
+    b.paye, b.revente = b.paye + paid, b.revente + vendorUnit * received
 end
 
 -- unitArg / totalArg : prix annoncés par le serveur (objets empilables), pour le journal.
@@ -515,6 +564,7 @@ ReportPurchase = function(p)
         else
             paid = moneyDrop
         end
+        AnoBilan() -- (reprise de l'historique AVANT d'écrire cet achat dans le journal : pas de double compte)
         JournalAchat(string.format("%s %s (id %d) : demandé %d, reçu %d, payé %d pc, prix marchand %d pc, "
             .. "annoncé total %s / unité %s", date("%d/%m %H:%M:%S"), p.name, p.id, p.qty, received, paid,
             p.vendor, tostring(p.expected), tostring(p.unitArg)))
@@ -522,6 +572,7 @@ ReportPurchase = function(p)
         local blocked = false
         if received > 0 then
             ns.AddInbound(p.id, received) -- arrive par courrier
+            AddAnoBilan(received, paid, p.vendor)
             local resale = p.vendor * received
             if resale > paid then
                 Msg(string.format("|cff00ff00acheté|r %d x %s pour %s (%s l'unité). Revente au marchand : %s, gain %s.",
@@ -1065,6 +1116,10 @@ DetailNext = function()
         detailRunning, studyStart = false, nil
         local items = Saved().items
         table.sort(items, function(a, b) return (a.profit or a.unitGain) > (b.profit or b.unitGain) end)
+        if globalMode then
+            globalMode = false
+            Msg(string.format("scan global terminé : %d objets étudiés.", detailTotal))
+        end
         SetStatus("")
         if detailStudied then
             detailStudied = false
@@ -1075,21 +1130,26 @@ DetailNext = function()
     local e = detailCurrent
     if e.study then
         studyStart = studyStart or GetTime()
-        if GetTime() - studyStart > STUDY_TIME then
+        if not globalMode and GetTime() - studyStart > STUDY_TIME then
             -- 10 min atteintes : on s'arrête là ; le prochain passage reprend avec les plus anciens.
             detailQueue, detailCurrent, detailRunning, studyStart = {}, nil, false, nil
-            SetStatus("Étude du marché : pause (10 min). Elle reprendra à ta prochaine visite.")
+            SetStatus("Étude du marché : pause (10 min). Elle reprendra à ta prochaine visite.", "EDM : pause")
             if detailStudied then detailStudied = false; if ns.JobsRefresh then ns.JobsRefresh() end end
             return
         end
     end
     e.commodity = IsCommodity(e.id)
-    if e.study then
+    if e.study and globalMode then
+        local done = detailTotal - #detailQueue
+        SetStatus(string.format("Scan global : étude du marché %d / %d (sans limite de temps)", done, detailTotal),
+            string.format("Global %d/%d", done, detailTotal))
+    elseif e.study then
         local left = studyStart and math.max(0, STUDY_TIME - (GetTime() - studyStart)) or STUDY_TIME
         SetStatus(string.format("Étude du marché : %d / %d  (encore %d min max)", detailTotal - #detailQueue,
-            detailTotal, math.ceil(left / 60)))
+            detailTotal, math.ceil(left / 60)), string.format("EDM %d/%d", detailTotal - #detailQueue, detailTotal))
     else
-        SetStatus(string.format("Vérification des quantités : %d / %d", detailTotal - #detailQueue, detailTotal))
+        SetStatus(string.format("Vérification des quantités : %d / %d", detailTotal - #detailQueue, detailTotal),
+            string.format("Vérif. %d/%d", detailTotal - #detailQueue, detailTotal))
     end
     detailToken = detailToken + 1
     local token = detailToken
@@ -1109,8 +1169,9 @@ end
 StartDetails = function(list)
     detailQueue, detailCurrent = {}, nil
     for _, e in ipairs(list) do detailQueue[#detailQueue + 1] = e end
-    -- Étude du marché : seulement les objets pas relevés depuis 1 h (inutile de refaire les autres).
-    for _, e in ipairs(StudyEntries(1800)) do detailQueue[#detailQueue + 1] = e end
+    -- Étude du marché : seulement les objets pas relevés depuis 30 min (inutile de refaire les autres) ;
+    -- scan global : TOUS les objets.
+    for _, e in ipairs(StudyEntries(not globalMode and 1800 or nil)) do detailQueue[#detailQueue + 1] = e end
     detailStudied = false
     detailTotal = #detailQueue
     detailRunning = detailTotal > 0
@@ -1136,6 +1197,15 @@ end
 
 local function StopDetails()
     detailQueue, detailCurrent, detailRunning = {}, nil, false
+end
+
+-- Scan global : le scan normal, puis l'étude de tout l'HV sans limite (voir globalMode).
+local function StartGlobalScan()
+    if scanRunning or globalMode then return end
+    globalMode = true
+    Msg("scan global lancé : tout l'HV, ça peut prendre une heure. Reste devant le commissaire-priseur.")
+    StartScan()
+    if not scanRunning then globalMode = false end
 end
 ns._StopDetails = StopDetails
 
@@ -1579,8 +1649,13 @@ UpdateWindow = function()
         win.status:SetText(string.format("Dernier scan : il y a %d min. %d objets rentables.",
             math.floor((time() - saved.time) / 60), #items))
     else
-        win.status:SetText("Aucun scan. Clique sur « Scanner l'HV ».")
+        win.status:SetText("Aucun scan. Clique sur « Scanner l'HV » (à droite).")
     end
+
+    local b = AnoBilan()
+    local profit = b.revente - b.paye
+    win.bilan:SetText(string.format("Profit total : %s%s|r  (%d achats)", profit >= 0 and "|cff5cffb0+" or "|cffff7373-",
+        Money(math.abs(profit)), b.n))
 
     FauxScrollFrame_Update(win.scroll, #items, ROWS, ROW_H)
     local offset = FauxScrollFrame_GetOffset(win.scroll)
@@ -1645,18 +1720,44 @@ local function CreateWindow(embedded)
     local title = H.Label(win, "Anomalies  ·  moins cher qu'au marchand", 13, H.CYAN)
     title:SetPoint("TOPLEFT", 14, -10)
 
-    local scanButton = H.Button(win, "Scanner l'HV", 130, 22, "solid")
-    scanButton:SetPoint("TOPLEFT", 12, -30)
-    scanButton:SetScript("OnClick", StartScan)
+    -- Bilan cumulé de tous les achats faits ici (revente supposée au marchand), en haut à droite ;
+    -- détail au survol. (Fenêtre à part, plus étroite : une ligne plus bas, à droite du bouton de scan.)
+    local bilanBox = CreateFrame("Frame", nil, win)
+    bilanBox:SetSize(300, 18)
+    bilanBox:SetPoint("TOPRIGHT", -14, embedded and -8 or -32)
+    win.bilan = H.Text(bilanBox, 13, H.TEXT)
+    win.bilan:SetPoint("RIGHT")
+    win.bilan:SetJustifyH("RIGHT")
+    bilanBox:EnableMouse(true)
+    bilanBox:SetScript("OnEnter", function(self)
+        local b = AnoBilan()
+        GameTooltip:SetOwner(self, "ANCHOR_BOTTOMLEFT")
+        GameTooltip:AddLine("Bilan des achats d'Anomalies")
+        GameTooltip:AddDoubleLine("Achats", string.format("%d (%d objets)", b.n, b.objets), 1, 1, 1, 1, 1, 1)
+        GameTooltip:AddDoubleLine("Payé à l'HV", Money(b.paye), 1, 1, 1, 1, 1, 1)
+        GameTooltip:AddDoubleLine("Revente au marchand", Money(b.revente), 1, 1, 1, 1, 1, 1)
+        GameTooltip:AddLine("Depuis le " .. (b.debut or "?") .. ", en supposant que tu revends tout au marchand.",
+            0.6, 0.6, 0.6, true)
+        GameTooltip:Show()
+    end)
+    bilanBox:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
+    -- Dans l'HV, les boutons de scan sont à droite de la fenêtre, au-dessus des onglets (SideTabs) :
+    -- le scan sert à tout (Anomalies, Métiers, étude du marché). Fenêtre à part : bouton ici.
+    local up = embedded and 26 or 0
+    if not embedded then
+        local scanButton = H.Button(win, "Scanner l'HV", 130, 22, "solid")
+        scanButton:SetPoint("TOPLEFT", 12, -30)
+        scanButton:SetScript("OnClick", StartScan)
+    end
 
     win.status = H.Text(win, 12, H.SOFT)
-    win.status:SetPoint("TOPLEFT", 12, -60)
+    win.status:SetPoint("TOPLEFT", 12, -60 + up)
     win.status:SetPoint("RIGHT", -12, 0)
     win.status:SetJustifyH("LEFT")
 
     win.scroll = CreateFrame("ScrollFrame", "EryAnomaliesScroll", win, "FauxScrollFrameTemplate")
-    win.scroll:SetPoint("TOPLEFT", 10, -76)
+    win.scroll:SetPoint("TOPLEFT", 10, -76 + up)
     win.scroll:SetPoint("RIGHT", win, "RIGHT", -32, 0)
     win.scroll:SetHeight(ROWS * ROW_H)
     win.scroll:SetScript("OnVerticalScroll", function(self, offset)
@@ -1854,20 +1955,55 @@ if DEFAULT_CHAT_FRAME then
     hooksecurefunc(DEFAULT_CHAT_FRAME, "AddMessage", function(_, text) pcall(OnSystemText, text) end)
 end
 
+-- Prix de vente total d'un courrier. BUG VÉCU (08/11) : pour un objet EMPILABLE (potion, élixir, étoffe),
+-- Forever met dans « buyout » le NOMBRE d'objets vendus (3 Élixirs vendus 4 pa 80 → buyout = 3), pas le prix.
+-- La commission, elle, vaut toujours 5 % du prix (vérifié sur Kilt, Sac, Bottes, Gilet) : prix = commission x 20.
+-- On garde buyout (ou bid) seulement s'il colle à ce calcul (écart d'arrondi de la commission).
+local function InvoiceGross(bid, buyout, fee)
+    fee = tonumber(fee) or 0
+    if fee <= 0 then return tonumber(buyout) or tonumber(bid) or 0 end
+    local est = fee * 20
+    for _, v in ipairs({ tonumber(buyout) or 0, tonumber(bid) or 0 }) do
+        if math.abs(v - est) <= 20 + est * 0.01 then return v end
+    end
+    return est
+end
+
+-- Réparation des ventes déjà enregistrées avec ce bug (une fois) : net = quantité − commission, donc
+-- net < quantité (impossible pour une vraie vente) ; commission = quantité − net, vrai net = commission x 19.
+local function RepairInvoiceNets(d)
+    if d.netsRepares then return end
+    for _, f in ipairs(d.faits or {}) do
+        local qty = f.qty or 1
+        if f.kind == "vendu" and f.net and f.net < qty then
+            local fee = qty - f.net
+            if fee > 0 then f.net = fee * 19 end
+        end
+    end
+    d.netsRepares = true
+end
+
 -- Courriers « Vente réussie » : montant exact. Chaque courrier n'est compté qu'une fois (signature +
 -- nombre déjà comptés, remis à jour quand des courriers disparaissent de la boîte).
 local function ReadInvoices()
     if not (GetInboxNumItems and GetInboxInvoiceInfo) then return end
     local d = MV()
+    RepairInvoiceNets(d)
     local present = {}
     local list = {}
     for i = 1, GetInboxNumItems() do
-        local ok, kind, itemName, _, _, buyout, deposit, fee, _, _, _, count = pcall(GetInboxInvoiceInfo, i)
+        local ok, kind, itemName, _, bid, buyout, deposit, fee, _, _, _, count = pcall(GetInboxInvoiceInfo, i)
         if ok and kind == "seller" and itemName and buyout then
             local key = table.concat({ itemName, buyout, deposit or 0, fee or 0, count or 0 }, "|")
             present[key] = (present[key] or 0) + 1
             if present[key] > (d.courriers[key] or 0) then
-                list[#list + 1] = { name = itemName, gross = buyout, fee = fee or 0, count = count, key = key }
+                list[#list + 1] = { name = itemName, gross = InvoiceGross(bid, buyout, fee), fee = fee or 0,
+                    count = count, key = key }
+                -- Valeurs brutes des 10 derniers courriers (diagnostic, lisible par Claude).
+                d.brut = d.brut or {}
+                table.insert(d.brut, 1, table.concat({ itemName, tostring(bid), tostring(buyout), tostring(deposit),
+                    tostring(fee), tostring(count) }, "|"))
+                while #d.brut > 10 do table.remove(d.brut) end
             end
         end
     end
@@ -1901,6 +2037,7 @@ mailWatch:SetScript("OnEvent", function() pcall(ReadInvoices) end)
 function ns.MySales(itemID)
     local d = EryAddonDB and EryAddonDB.mesVentes
     if not d then return nil end
+    RepairInvoiceNets(d)
     local s = { vendus = 0, net = 0, benef = 0, coutConnu = true, delai = 0, nDelai = 0, expires = 0,
         depotPerdu = 0, enCours = 0 }
     local any = false
@@ -1944,6 +2081,7 @@ end
 -- Tous les objets que tu as vendus ou mis en vente, pour l'onglet « Mes ventes ».
 function ns.MySalesItems()
     local d = EryAddonDB and EryAddonDB.mesVentes
+    if d then RepairInvoiceNets(d) end
     local seen, list = {}, {}
     for _, src in ipairs({ d and d.faits or {}, d and d.annonces or {} }) do
         for _, f in ipairs(src) do
@@ -2074,6 +2212,76 @@ local function CreateMySalesPanel(parent)
     return p
 end
 
+-- Onglets à la VERTICALE, collés au bord droit de l'HV (demande de Jérémie : en bas, avec ceux du jeu et
+-- d'Auctionator, « Mes ventes » dépassait de la fenêtre). Les onglets de LibAHTab restent (ils gèrent la
+-- sélection, le titre et la fermeture des autres pages) mais leurs boutons du bas sont cachés.
+local function SideTabs(lib, list)
+    local H = ns.Holo
+    local buttons = {}
+    local function Mark(selectedID)
+        for id, b in pairs(buttons) do b:SetStyle(id == selectedID and "solid" or "outline") end
+    end
+    -- Panneau à FOND PLEIN derrière toute la colonne (demande de Jérémie : en transparence, on voyait le
+    -- décor et les noms des joueurs à travers les boutons). Même habillage que nos fenêtres (Holo.Skin).
+    local panel = CreateFrame("Frame", nil, AuctionHouseFrame)
+    -- −28 : même hauteur que le haut de nos pages dans l'HV (CreateWindow : TOPLEFT 8, −28), coins alignés.
+    panel:SetPoint("TOPLEFT", AuctionHouseFrame, "TOPRIGHT", 0, -28)
+    H.Skin(panel)
+    panel:EnableMouse(true) -- les clics ne traversent pas vers le monde
+    -- En haut : les deux scans (ils servent à tous les onglets) et leur état en version courte.
+    local scan = H.Button(panel, "Scanner l'HV", 104, 26, "muted")
+    scan:SetPoint("TOPLEFT", panel, "TOPLEFT", 6, -6)
+    scan:SetScript("OnClick", StartScan)
+    local global = H.Button(panel, "Scan global", 104, 26, "muted")
+    global:SetPoint("TOPLEFT", scan, "BOTTOMLEFT", 0, -4)
+    global:SetScript("OnClick", StartGlobalScan)
+    global:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:AddLine("Scan global")
+        GameTooltip:AddLine("Scan + étude du marché de TOUS les objets de l'HV, sans limite de temps (environ 1 h).", 1, 1, 1, true)
+        GameTooltip:AddLine("Reste devant le commissaire-priseur : fermer l'HV l'arrête (ce qui est relevé est gardé).", 1, 1, 1, true)
+        GameTooltip:Show()
+    end)
+    global:SetScript("OnLeave", function(self) GameTooltip:Hide(); self:SetStyle(self.style) end)
+    sideStatus = H.Text(panel, 11, H.SOFT)
+    sideStatus:SetPoint("TOPLEFT", global, "BOTTOMLEFT", 2, -6)
+    sideStatus:SetWidth(100)
+    sideStatus:SetJustifyH("LEFT")
+    sideStatus:SetWordWrap(true)
+    AuctionHouseFrame:HookScript("OnShow", UpdateSide)
+    UpdateSide()
+    local prev
+    for _, t in ipairs(list) do
+        local id, label = t[1], t[2]
+        if lib:DoesIDExist(id) then
+            local old = lib:GetButton(id)
+            old:Hide()
+            old:HookScript("OnShow", old.Hide) -- au cas où quelqu'un la réaffiche
+            local b = H.Button(panel, label, 104, 26, "outline")
+            if prev then
+                b:SetPoint("TOPLEFT", prev, "BOTTOMLEFT", 0, -4)
+            else
+                b:SetPoint("TOPLEFT", global, "BOTTOMLEFT", 0, -44) -- sous l'état du scan (2 lignes)
+            end
+            b:SetScript("OnClick", function() lib:SetSelected(id) end)
+            buttons[id] = b
+            prev = b
+        end
+    end
+    -- Taille CALCULÉE (pas d'accroche au dernier bouton : il dépend lui-même du panneau, et le jeu refuse
+    -- cette boucle, erreur « Cannot anchor to a region dependent on it » vue le 08/11).
+    -- Marge 6 + scan 26 + 4 + global 26 + 44 (état) + onglets (26 + 4 entre eux) + marge 6.
+    local n = 0
+    for _ in pairs(buttons) do n = n + 1 end
+    panel:SetSize(6 + 104 + 6, 6 + 26 + 4 + 26 + 44 + n * 26 + math.max(0, n - 1) * 4 + 6)
+    -- Onglet choisi (le nôtre ou celui d'Auctionator) : surbrillance à jour.
+    hooksecurefunc(lib, "SetSelected", function(_, id) Mark(id) end)
+    -- Onglet du jeu (Acheter, Vendre…) : aucun des nôtres n'est choisi.
+    hooksecurefunc(AuctionHouseFrame, "SetDisplayMode", function(_, mode)
+        if mode ~= nil and #mode > 0 then Mark(nil) end
+    end)
+end
+
 local function CreateTabs()
     local lib = TabLib()
     if tabsCreated or not lib then return tabsCreated end
@@ -2086,6 +2294,8 @@ local function CreateTabs()
     end
     local ventes = CreateMySalesPanel(AuctionHouseFrame)
     lib:CreateTab("EryAddon_MesVentes", ventes, "Mes ventes", "Mes ventes : délai, prix et bénéfice réels")
+    SideTabs(lib, { { "EryAddon_Anomalies", "Anomalies" }, { "EryAddon_Jobs", "Métiers" },
+        { "EryAddon_MesVentes", "Mes ventes" } })
     return true
 end
 
@@ -2128,11 +2338,15 @@ frame:SetScript("OnEvent", function(_, event, ...)
         -- proprement ; ce qui est déjà relevé est gardé, la suite reprend à la prochaine ouverture.
         ResetBuyer()
         StopDetails()
+        if globalMode then
+            globalMode = false
+            Msg("scan global interrompu (HV fermé). Ce qui est relevé est gardé ; relance-le à ta prochaine visite.")
+        end
         if scanRunning then
             scanRunning = false
             scanToken = scanToken + 1 -- les relances programmées du scan s'annulent
             scanResults, scanQty, scanKeys = {}, {}, {}
-            SetStatus("Scan interrompu (HV fermé) : relance-le à ta prochaine visite.")
+            SetStatus("Scan interrompu (HV fermé) : relance-le à ta prochaine visite.", "Scan interrompu")
         end
         if Course then
             if Course.state == "starting" or Course.state == "confirm" then

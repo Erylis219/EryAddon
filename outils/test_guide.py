@@ -200,9 +200,19 @@ local st4 = ns.MarketState(994)
 out[#out + 1] = "seulement un vieux bilan : " .. st4.etat .. string.format(" %.0f / jour", st4.parJour) .. (st4.ancien and " (daté)" or " (pas daté)")
 MARCHE = table.concat(out, " || ")
 ITEMS = #ns.MarketItems()
+-- Ordre de l'étude du marché (propagation autour du niveau) : les 40 premiers objets de recettes.
+local byOut = {}
+for _, r in ipairs(ns.RECETTES) do byOut[r[3]] = byOut[r[3]] or r end
+local o = {}
+for _, id in ipairs(ns.MarketItems()) do
+  local r = byOut[id]
+  if r and #o < 40 then o[#o + 1] = string.format("%s %d", (ns.METIERS[r[1]] or "?"):sub(1, 4), r[4]) end
+end
+ORDRE = table.concat(o, ", ")
 ''', ns)
 print(L.globals().MARCHE)
 print("objets à étudier :", L.globals().ITEMS)
+print("ordre (métier, niveau d'apprentissage) :", L.globals().ORDRE)
 
 # ESSAI TOUS LES MÉTIERS : route du niveau 1 au niveau 75 (métiers pas appris), bilan de chacun.
 for prof, name in [(164, "Forge"), (165, "Travail du cuir"), (202, "Ingénierie"), (333, "Enchantement"),

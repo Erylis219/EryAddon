@@ -799,8 +799,9 @@ local function TabLabel(pr)
     return pr.learned and (name .. " " .. (SkillOf(pr.name) or "?")) or name
 end
 
--- Objets à étudier sur le marché (EryAddon_HV.lua, après chaque scan) : ce que tes métiers de
--- fabrication savent faire jusqu'à leur maximum actuel (120 au plus).
+-- Objets à étudier en PRIORITÉ sur le marché (EryAddon_HV.lua, StudyEntries) : tes ventes, puis les
+-- objets de tes métiers principaux en propagation autour de ton niveau (voir Propagation), puis leurs
+-- composants (400 au plus). secondaryOnly : Secourisme / Cuisine, étudiés en dernier.
 function ns.MarketItems(secondaryOnly)
     local LIMIT = 400
     local ids, seen = {}, {}
@@ -825,32 +826,49 @@ function ns.MarketItems(secondaryOnly)
             level[pr.id] = LevelOf(pr)
         end
     end
-    local function Useful(r)
-        local grey = (r[9] or 0) > 0 and r[9] or (r[4] + 60)
-        return grey > (level[r[1]] or 1)
-    end
-    local function Pass(profs, onlyUseful, reagents)
+    -- Recettes des métiers PRINCIPAUX en « propagation » autour de ton niveau (demande de Jérémie, 08/11) :
+    -- chaque métier part de SON niveau et s'en éloigne d'un cran à la fois, vers le haut ET vers le bas
+    -- (distance = |niveau d'apprentissage − ton niveau|) ; tous tes métiers avancent en même temps, et à
+    -- distance égale le métier le plus monté passe d'abord, puis la recette en dessous de ton niveau.
+    local function Propagation(profs)
+        local ranks = {}
+        for id in pairs(profs) do ranks[#ranks + 1] = id end
+        table.sort(ranks, function(a, b)
+            if (level[a] or 1) ~= (level[b] or 1) then return (level[a] or 1) > (level[b] or 1) end
+            return a < b
+        end)
+        local rankOf = {}
+        for i, id in ipairs(ranks) do rankOf[id] = i end
+        local list = {}
         for _, r in ipairs(ns.RECETTES or {}) do
-            local cap = profs[r[1]]
-            if cap and r[4] <= cap and (onlyUseful == nil or Useful(r) == onlyUseful) then
-                if reagents then
-                    local _, _, reag = RecipeData(r[2])
-                    for id in (reag or ""):gmatch("(%d+):%d+") do Add(tonumber(id)) end
-                else
-                    Add(r[3])
-                end
+            if rankOf[r[1]] then
+                local diff = (r[4] or 1) - (level[r[1]] or 1)
+                list[#list + 1] = { r = r, d = math.abs(diff), up = diff > 0, rank = rankOf[r[1]] }
             end
         end
+        table.sort(list, function(a, b)
+            if a.d ~= b.d then return a.d < b.d end
+            if a.rank ~= b.rank then return a.rank < b.rank end
+            if a.up ~= b.up then return not a.up end
+            return a.r[2] < b.r[2]
+        end)
+        return list
     end
     if secondaryOnly then
         -- Secourisme, Cuisine : en DERNIER, après tout le reste de l'HV (ordre voulu par Jérémie).
         ids, seen = {}, {}
-        Pass(second, nil, false)
+        for _, r in ipairs(ns.RECETTES or {}) do
+            local cap = second[r[1]]
+            if cap and r[4] <= cap then Add(r[3]) end
+        end
         return ids
     end
-    Pass(main, true, false)   -- ce que tu fabriques à ton niveau
-    Pass(main, true, true)    -- leurs composants
-    Pass(main, false, false)  -- recettes déjà grises
+    local around = Propagation(main)
+    for _, x in ipairs(around) do Add(x.r[3]) end -- les objets fabriqués, du plus proche au plus loin
+    for _, x in ipairs(around) do                 -- puis leurs composants, dans le même ordre
+        local _, _, reag = RecipeData(x.r[2])
+        for id in (reag or ""):gmatch("(%d+):%d+") do Add(tonumber(id)) end
+    end
     return ids
 end
 
