@@ -15,7 +15,7 @@ local function AnySecret(...)
 end
 
 local function Msg(text)
-    print("|cff66ccffEryAddon|r : " .. text)
+    print("|cff66ccffFDC|r : " .. text) -- FDC = Federytion Du Commerce (nom public, 09/11)
 end
 
 -- Liste des fonctions (features) de l'add-on, dans l'ordre du panneau.
@@ -839,7 +839,7 @@ end
 local function CreatePanel()
     -- Habillage « Holo » (EryAddon_Theme.lua).
     local H = ns.Holo
-    panel = H.Window("EryAddonPanel", 440, 46 + #features * 28, "EryAddon", "Fonctions")
+    panel = H.Window("EryAddonPanel", 440, 46 + #features * 28, "FDC", "Federytion Du Commerce")
     panel:SetPoint("CENTER")
     panel:SetFrameStrata("DIALOG")
 
@@ -1386,7 +1386,8 @@ end
 
 -- Les commandes « / » de WoW ne tiennent pas compte des majuscules :
 -- /eryaddon, /EryAddon, /ERYADDON fonctionnent tous.
-SLASH_ERYADDON1 = "/eryaddon"
+SLASH_ERYADDON1 = "/fdc"
+SLASH_ERYADDON2 = "/eryaddon" -- (ancien nom, gardé : même panneau)
 SlashCmdList.ERYADDON = function()
     if not panel then CreatePanel() end
     panel:SetShown(not panel:IsShown())
@@ -1398,6 +1399,56 @@ end
 local main = CreateFrame("Frame")
 main:RegisterEvent("ADDON_LOADED")
 main:RegisterEvent("PLAYER_LOGIN")
+
+---------------------------------------------------------------------------
+-- MÉMOIRE DE LA BANQUE (09/11, demande de Jérémie : « qu'il sache ce que j'ai en banque, comme ce que j'ai sur
+-- moi »). Le jeu ne donne le contenu de la banque que banque OUVERTE : à chaque ouverture, et à chaque
+-- changement pendant qu'elle est ouverte, on relève tout (case de la banque + sacs de banque + banque de
+-- composants s'il y en a une) dans EryAddonDB.banque["Perso-Royaume"] = { t, items = { [objet] = quantité } }.
+-- ns.BankCount(objet) : ce qu'il y avait à la dernière visite.
+---------------------------------------------------------------------------
+local bankOpen = false
+local function BankKey()
+    return (UnitName("player") or "?") .. "-" .. (GetRealmName and GetRealmName() or "?")
+end
+local function ReadBank()
+    if not (bankOpen and C_Container and C_Container.GetContainerNumSlots) then return end
+    local bags = { (Enum and Enum.BagIndex and Enum.BagIndex.Bank) or BANK_CONTAINER or -1 }
+    local first = (NUM_TOTAL_EQUIPPED_BAG_SLOTS or NUM_BAG_SLOTS or 4) + 1
+    for b = first, first + (NUM_BANKBAGSLOTS or 7) - 1 do bags[#bags + 1] = b end
+    if Enum and Enum.BagIndex and Enum.BagIndex.Reagentbank then bags[#bags + 1] = Enum.BagIndex.Reagentbank end
+    local items = {}
+    for _, bag in ipairs(bags) do
+        local okN, n = pcall(C_Container.GetContainerNumSlots, bag)
+        for slot = 1, (okN and n) or 0 do
+            local ok, info = pcall(C_Container.GetContainerItemInfo, bag, slot)
+            if ok and info and info.itemID then items[info.itemID] = (items[info.itemID] or 0) + (info.stackCount or 1) end
+        end
+    end
+    EryAddonDB.banque = EryAddonDB.banque or {}
+    EryAddonDB.banque[BankKey()] = { t = time(), items = items }
+    if ns.JobsRefresh then ns.JobsRefresh() end
+end
+function ns.BankCount(itemID)
+    local b = EryAddonDB and EryAddonDB.banque and EryAddonDB.banque[BankKey()]
+    return (b and b.items and b.items[itemID]) or 0
+end
+local bankFrame = CreateFrame("Frame")
+for _, e in ipairs({ "BANKFRAME_OPENED", "BANKFRAME_CLOSED", "PLAYERBANKSLOTS_CHANGED", "PLAYERREAGENTBANKSLOTS_CHANGED",
+    "BAG_UPDATE_DELAYED" }) do
+    pcall(bankFrame.RegisterEvent, bankFrame, e)
+end
+bankFrame:SetScript("OnEvent", function(_, event)
+    if event == "BANKFRAME_OPENED" then
+        bankOpen = true
+        C_Timer.After(0.3, ReadBank)
+    elseif event == "BANKFRAME_CLOSED" then
+        ReadBank() -- dernier état avant fermeture
+        bankOpen = false
+    elseif bankOpen then
+        C_Timer.After(0.3, ReadBank)
+    end
+end)
 main:SetScript("OnEvent", function(_, event, arg1)
     if event == "ADDON_LOADED" and arg1 == ADDON_NAME then
         EryAddonDB = EryAddonDB or {}
@@ -1405,10 +1456,16 @@ main:SetScript("OnEvent", function(_, event, arg1)
             if EryAddonDB[key] == nil then EryAddonDB[key] = value end
         end
         EryAddonDB.test = nil -- ancien relevé de la commande /eryaddon test (supprimée)
+        -- Étude du marché, scan global et sonde du scan complet RETIRÉS (09/11, décision de Jérémie : TSM
+        -- donne les ventes par jour) : leurs données sont effacées de la sauvegarde.
+        EryAddonDB.hvMarche, EryAddonDB.hvCles, EryAddonDB.sondeReplicate, EryAddonDB.hvEcoul = nil, nil, nil, nil
+        EryAddonDB.scanDiag = nil -- mouchard du blocage de l'HV (09/11) : retiré, causes trouvées
+        -- Objets « muets » notés à tort avant le 09/11 au soir (clic pendant la vérification) : liste remise à zéro.
+        if EryAddonDB.hvMuetsV ~= 2 then EryAddonDB.hvMuets, EryAddonDB.hvMuetsV = nil, 2 end
     elseif event == "PLAYER_LOGIN" then
         for _, feature in ipairs(features) do
             if EryAddonDB[feature.key] then feature.Enable() end
         end
-        Msg("chargé. Tape /eryaddon pour les réglages.")
+        Msg("chargé. Tape /fdc pour les réglages.")
     end
 end)

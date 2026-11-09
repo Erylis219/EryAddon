@@ -157,7 +157,7 @@ end
 local function UpdateTop()
     if not win then return end
     local s = EryAddonDB and EryAddonDB.hvScan
-    -- Scan / vérification / étude en cours : son état court (« Scan : 1200 objets », « EDM 71/3711 »…).
+    -- Scan / vérification / étude en cours : son état court (« Scan : 1200 objets », « Vérif. 3/12 »…).
     local short = ns.AnoAPI and ns.AnoAPI.ShortStatus and ns.AnoAPI.ShortStatus() or ""
     if short ~= "" then
         win.scanChip:SetText((short:gsub("\n", " ")))
@@ -441,22 +441,33 @@ local function LowestOther()
 end
 
 -- Les prix proposés (boutons au-dessus de la durée).
--- Le jeu n'accepte que des prix en PIÈCES D'ARGENT ENTIÈRES (67 pa 99 refusé, 68 pa accepté ; TSM arrondit pareil),
--- 1 pa au minimum. Donc « passer dessous » = 1 pa de moins, pas 1 pc.
-local function Silver(p) return math.max(100, math.floor((p or 0) / 100 + 0.5) * 100) end
+-- Objets NON EMPILABLES : le jeu n'accepte que des prix en PIÈCES D'ARGENT ENTIÈRES (Anciens gants : 67 pa 99
+-- refusé, 68 pa accepté), 1 pa au minimum → « passer dessous » = 1 pa de moins. Objets EMPILABLES : le cuivre passe
+-- (potions en vente à 19 pa 84) → 1 pc de moins.
+local function SilverOnly() return not (sel and sel.commodity) end
+local function Silver(p)
+    p = math.floor((p or 0) + 0.5)
+    if not SilverOnly() then return math.max(1, p) end
+    return math.max(100, math.floor(p / 100 + 0.5) * 100)
+end
 
 local function Proposals()
     local out = {}
     local low = LowestOther()
     if low then
-        out[#out + 1] = { key = "under", label = "1 pa sous le moins cher", value = math.max(100, math.ceil(low / 100) * 100 - 100) }
-        out[#out + 1] = { key = "align", label = "Aligner", value = math.max(100, math.floor(low / 100) * 100) }
+        -- (Pas de bouton « Aligner » : RÈGLE DE JÉRÉMIE, on ne met jamais en vente sans être le moins cher.)
+        if SilverOnly() then
+            out[#out + 1] = { key = "under", label = "1 pa sous le moins cher", value = math.max(100, math.ceil(low / 100) * 100 - 100) }
+        else
+            out[#out + 1] = { key = "under", label = "1 pc sous le moins cher", value = math.max(1, low - 1) }
+        end
     end
+    -- Prix du marché / vente moyenne : proposés seulement s'ils restent sous le moins cher des autres.
     if sel and ns.TSM then
         local m = ns.TSM("DBMarket", sel.id)
-        if m and m > 0 then out[#out + 1] = { key = "market", label = "Prix du marché", value = Silver(m) } end
+        if m and m > 0 and (not low or Silver(m) < low) then out[#out + 1] = { key = "market", label = "Prix du marché", value = Silver(m) } end
         local a = ns.TSM("DBRegionSaleAvg", sel.id)
-        if a and a > 0 then out[#out + 1] = { key = "avg", label = "Vente moyenne", value = Silver(a) } end
+        if a and a > 0 and (not low or Silver(a) < low) then out[#out + 1] = { key = "avg", label = "Vente moyenne", value = Silver(a) } end
     end
     return out
 end
@@ -471,17 +482,17 @@ end
 local function ReadPrice()
     local po = tonumber(V.po.edit:GetText()) or 0
     local pa = tonumber(V.pa.edit:GetText()) or 0
-    price = po * 10000 + pa * 100 -- (pas de pièces de cuivre : voir Silver)
+    local pc = SilverOnly() and 0 or (tonumber(V.pc.edit:GetText()) or 0) -- (non empilable : pas de cuivre, voir Silver)
+    price = po * 10000 + pa * 100 + pc
     choice = nil
     for _, p in ipairs(Proposals()) do if p.value == price then choice = p.key break end end
 end
 
 -- Durée conseillée : 24 h si ce que tu vends met plus de 8 h à partir (sinon une partie expire et le dépôt est
 -- perdu), 8 h sinon.
+-- Durée proposée : 2 h, toujours (choix de Jérémie, 09/11) ; il change à la main s'il veut 8 h ou 24 h.
 local function DefaultDuration()
-    local perDay = ns.HVSalesPerDay and ns.HVSalesPerDay(sel.id)
-    if perDay and perDay > 0 and qty / perDay * 24 <= 6 then return 2 end
-    return 3
+    return 1
 end
 
 function F.Search()
@@ -497,13 +508,18 @@ function F.Search()
     end
     if not sel.itemKey then return end
     listings = nil
-    local sorts = { { sortOrder = Enum.AuctionHouseSortOrder.Price, reverseSort = false } }
+    -- Comme TSM (AuctionHouseWrapper) : SANS tri, et pour la recherche de vente, niveau d'objet à 0 (« bug du jeu :
+    -- MakeItemKey ajoute un niveau d'objet qui casse la recherche »).
+    local sorts = {}
     -- 1er essai : la recherche « de vente » (celle de Blizzard / Auctionator) ; si elle ne répond pas, la
-    -- recherche normale, celle qu'utilisent déjà Anomalies et l'étude du marché.
+    -- recherche normale, celle qu'utilise déjà Anomalies.
     if sel.retried then
         C_AuctionHouse.SendSearchQuery(sel.itemKey, sorts, true)
     else
-        C_AuctionHouse.SendSellSearchQuery(sel.itemKey, sorts, true)
+        local k = {}
+        for f, v in pairs(sel.itemKey) do k[f] = v end
+        k.itemLevel = 0
+        C_AuctionHouse.SendSellSearchQuery(k, sorts, true)
     end
     -- Pas de réponse en 4 s (le serveur a pu jeter la demande) : on redemande une fois.
     local asked = sel
@@ -517,7 +533,7 @@ function F.IsOpen() return win ~= nil and win:IsShown() end
 F._Test = function() return V, sel, price, qty, durIdx, listings end -- pour le test hors jeu
 
 function F.Select(entry)
-    if ns._StopDetails then ns._StopDetails() end -- l'étude du marché laisse la place (une recherche à la fois)
+    if ns._StopDetails then ns._StopDetails() end -- la vérification laisse la place (une recherche à la fois)
     sel = entry
     listings, choice = nil, nil
     qty = entry.count
@@ -566,9 +582,22 @@ local function Blocked()
     if sel.vendor > 0 and price * (1 - COMMISSION) < sel.vendor then
         return "Bloqué sous " .. Money(math.ceil(sel.vendor / (1 - COMMISSION))) .. " (prix marchand)"
     end
+    -- RÈGLE DE JÉRÉMIE (09/11) : jamais en vente sans être le moins cher (égalité comprise).
+    if listings == nil then return "Lecture des annonces…" end
+    local low = LowestOther()
+    if low and price >= low then return "Plus cher que " .. Money(low) .. " : passe dessous" end
+end
+
+local function LockCopper()
+    local lock = SilverOnly()
+    V.pc.edit:EnableMouse(not lock)
+    if lock and V.pc.edit:HasFocus() then V.pc.edit:ClearFocus() end
+    if lock then V.pc.edit:SetTextColor(0.37, 0.5, 0.56) else V.pc.edit:SetTextColor(unpack(H().TEXT)) end
+    V.pc:SetAlpha(lock and 0.6 or 1)
 end
 
 function F.UpdateSell()
+    LockCopper()
     if not (win and win:IsShown()) then return end
     local Hc = H()
     -- En-tête de l'objet.
@@ -810,8 +839,7 @@ local function CreateSellScreen(content)
     V.pa = NumberBox(c, pw, 44, 20, OnPrice); V.pa:SetPoint("LEFT", V.po, "RIGHT", 8, 0)
     V.pc = NumberBox(c, pw, 44, 20, OnPrice); V.pc:SetPoint("LEFT", V.pa, "RIGHT", 8, 0)
     V.po.edit:SetMaxLetters(5); V.pa.edit:SetMaxLetters(2); V.pc.edit:SetMaxLetters(2)
-    -- Cuivre toujours à 0 : le jeu refuse les prix qui ne tombent pas pile sur une pièce d'argent.
-    V.pc.edit:EnableMouse(false); V.pc.edit:SetTextColor(0.37, 0.5, 0.56); V.pc:SetAlpha(0.6)
+    -- Case du cuivre : bloquée à 0 pour un objet non empilable (voir Silver), libre sinon (LockCopper).
     for _, pair in ipairs({ { V.po, "|TInterface\\MoneyFrame\\UI-GoldIcon:0|t" }, { V.pa, "|TInterface\\MoneyFrame\\UI-SilverIcon:0|t" },
         { V.pc, "|TInterface\\MoneyFrame\\UI-CopperIcon:0|t" } }) do
         local ic = Hc.Text(pair[1], 14, Hc.TEXT); ic:SetPoint("RIGHT", -6, 0); ic:SetText(pair[2])
@@ -917,8 +945,14 @@ local mSel             -- recette choisie (entrée de Compute)
 local mWant = 1        -- nombre de fabrications voulu
 local mList = {}       -- recettes de la liste
 local mOffset = 0      -- défilement de la liste
+local mLevel           -- niveau SIMULÉ (champ « Niv. ») ; nil = ton vrai niveau (demande de Jérémie, 09/11 :
+                       -- voir les recettes d'un métier pas appris, ou d'un niveau pas encore atteint)
 local mFiche           -- résultat de Needs pour la recette choisie
-local MLIST_ROWS, MREAG_ROWS = 17, 9
+local MLIST_ROWS = 17
+-- Arbre de la recette (maquette « 6b » validée par Jérémie, 09/11) et colonne « TOTAL (SACS + BANQUE) ».
+local TREE_ROWS, TREE_GUIDES, NEED_ROWS, TREE_STEP = 14, 6, 9, 18
+local mFolded, mTreeOffset, mNeedOffset = {}, 0, 0
+local mTreeRows, mNeeds = {}, {}
 
 local COLOR_INFO = {
     optimal = { "orange", { 1, 0.6, 0.24 } }, medium = { "jaune", { 1, 0.88, 0.3 } },
@@ -953,7 +987,7 @@ end
 local function BuildList()
     mList = {}
     if not (mProf and API()) then return end
-    local skill = API().LevelOf(mProf)
+    local skill = mLevel or API().LevelOf(mProf)
     local all = API().Compute(mProf.id, skill)
     local monter = EryAddonDB.jobsMonter
     for _, e in ipairs(all) do
@@ -1011,6 +1045,11 @@ local function DrawTabs()
             b:Hide()
         end
     end
+    if Mt.level and mProf and not Mt.level.edit:HasFocus() then
+        local real = API().LevelOf(mProf)
+        Mt.level.edit:SetText(mLevel or real)
+        Mt.level.edit:SetTextColor(unpack(mLevel and mLevel ~= real and H().ORANGE or H().TEXT))
+    end
 end
 
 -- La fiche de la recette choisie.
@@ -1067,69 +1106,116 @@ local function DrawFiche()
         f.gainN:SetText("?")
     end
     f.gainNLabel:SetText(H().Upper("Gain pour " .. mWant))
-    f.colNeed:SetText(H().Upper("Pour " .. mWant))
 
-    -- Composants.
-    local list, _, _, info = API().Needs(e, mWant)
+    -- Arbre (à gauche) et totaux à réunir (à droite).
+    local list = API().Needs(e, mWant)
     mFiche = list
-    local toPay, clicks = 0, 0
-    for i, row in ipairs(f.reag) do
-        local l = list[i]
-        if i == MREAG_ROWS and #list > MREAG_ROWS then
-            row.name:SetText(string.format("|cff5f8a99… et %d autres lignes|r", #list - MREAG_ROWS + 1))
-            row.sub:SetText(""); row.need:SetText(""); row.have:SetText(""); row.miss:SetText(""); row.price:SetText("")
-            row.one:Hide(); row.all:Hide(); row.line = nil
-            row:Show()
-        elseif l then
-            row.line = l
-            local indent = (l.indent or 0) * 14
-            row.name:SetPoint("TOPLEFT", 10 + indent, -4)
-            row.name:SetWidth(230 - indent) -- décalé (sous-composant) : il s'arrête quand même avant « Pour N »
-            row.name:SetText(l.name)
-            row.name:SetTextColor(unpack(l.recipe and Hc.ORANGE or Hc.TEXT))
-            row.sub:SetText(l.recipe and "recette" or (l.per and l.per ~= "" and (l.per .. " / fab.") or ""))
-            row.need:SetText(l.need or "")
-            row.have:SetText(math.min(l.have or 0, l.need or 0))
-            local miss = l.missing or 0
-            row.miss:SetText(miss > 0 and miss or "")
-            row.miss:SetTextColor(unpack(miss > 0 and Hc.ORANGE or Hc.GREEN))
-            row.have:SetTextColor(unpack((l.have or 0) >= (l.need or 0) and Hc.GREEN or Hc.TEXT))
-            row.price:SetText(l.price or "")
-            local buyable = l.buy and miss > 0
-            -- Seulement chez un marchand (pas en vente à l'HV) et aucun marchand ouvert : bouton « Carte ».
-            local mapOnly = buyable and (l.buy.src or ""):find("marchand") and not (ns.PrixHV and ns.PrixHV(l.buy.id))
-                and not (MerchantFrame and MerchantFrame:IsShown()) and true or false
-            l._map = mapOnly
-            row.mapMode = mapOnly
-            if buyable then
-                toPay = toPay + (l.cost or 0)
-                if not mapOnly then clicks = clicks + 1 end
+    local root, where = API().Tree(e, mWant)
+    -- Arbre aplati, en sautant les branches repliées ; guides = traits de chaque niveau.
+    mTreeRows = {}
+    local function Walk(node, prefix, last)
+        local guides = {}
+        if node.depth > 0 then
+            for _, g in ipairs(prefix) do guides[#guides + 1] = g end
+            guides[#guides + 1] = last and "l" or "t"
+        end
+        mTreeRows[#mTreeRows + 1] = { node = node, guides = guides }
+        if mFolded[node.key] then return end
+        local next = {}
+        if node.depth > 0 then
+            for _, g in ipairs(prefix) do next[#next + 1] = g end
+            next[#next + 1] = last and "e" or "v"
+        end
+        for i, k in ipairs(node.kids) do Walk(k, next, i == #node.kids) end
+    end
+    Walk(root, {}, true)
+    Mt.treeRoot = root
+    mTreeOffset = math.max(0, math.min(mTreeOffset, #mTreeRows - TREE_ROWS))
+    local cyan = Hc.CYAN
+    for i, row in ipairs(f.tree) do
+        local t = mTreeRows[mTreeOffset + i]
+        row.t = t
+        if t then
+            local nd = t.node
+            for gi, g in ipairs(row.g) do
+                local k = t.guides[gi]
+                g.v:SetShown(k == "v" or k == "t" or k == "l")
+                g.v:ClearAllPoints()
+                if k == "l" then
+                    g.v:SetPoint("TOPLEFT", row, "TOPLEFT", (gi - 1) * TREE_STEP + 8, 0); g.v:SetHeight(13)
+                else
+                    g.v:SetPoint("TOPLEFT", row, "TOPLEFT", (gi - 1) * TREE_STEP + 8, 0)
+                    g.v:SetPoint("BOTTOMLEFT", row, "BOTTOMLEFT", (gi - 1) * TREE_STEP + 8, 0)
+                end
+                g.h:SetShown(k == "t" or k == "l")
             end
-            if mapOnly then
-                row.one:Hide()
-                row.all:SetLabel("Carte")
-                row.all:Show()
-            elseif buyable and l.buy.kind ~= "recipe" then
-                local per = tonumber(l.per) or 1
-                row.k = math.max(1, math.min(math.ceil(per), miss))
-                row.one:SetLabel("Pour 1 (+" .. row.k .. ")")
-                row.one:Show()
-                row.all:SetLabel("Tout")
-                row.all:Show()
-            elseif buyable then
-                row.one:Hide()
-                row.all:SetLabel("Acheter")
-                row.all:Show()
-            else
-                row.one:Hide(); row.all:Hide()
-            end
+            local x = math.min(#t.guides, TREE_GUIDES) * TREE_STEP
+            row.fold:SetShown(nd.depth > 0 and #nd.kids > 0)
+            row.fold:SetPoint("LEFT", row, "LEFT", x + 2, 0)
+            row.fold.t:SetText(mFolded[nd.key] and "+" or "-")
+            row.icon:SetPoint("LEFT", row, "LEFT", x + 20, 0)
+            local _, _, _, _, ic = ItemInfo(nd.id)
+            row.icon:SetTexture(ic or "Interface\\Icons\\INV_Misc_QuestionMark")
+            row.name:SetText(nd.depth == 0 and (nd.name .. " x" .. nd.qty) or nd.name)
+            row.name:SetTextColor(unpack(nd.depth == 0 and Hc.ORANGE or (nd.craft and Hc.TEXT or Hc.SOFT)))
+            row.qty:SetText(nd.depth == 0 and "" or nd.qty)
+            row.craft:SetText(nd.craft or "")
+            row.craftBox:SetShown(nd.craft ~= nil)
+            if nd.craft then row.craftBox:SetWidth(row.craft:GetStringWidth() + 12) end
+            row.bg:SetShown(nd.depth == 0)
             row:Show()
         else
-            row.line = nil
             row:Hide()
         end
     end
-    f.steps:SetText(info and info.etapes or "")
+
+    -- TOTAL (SACS + BANQUE) : une ligne par objet à réunir (les objets fabriqués n'y sont pas), un clic par ligne.
+    mNeeds = {}
+    for _, l in ipairs(list) do if not l.made then mNeeds[#mNeeds + 1] = l end end
+    mNeedOffset = math.max(0, math.min(mNeedOffset, #mNeeds - NEED_ROWS))
+    local toPay, clicks = 0, 0
+    for _, l in ipairs(mNeeds) do
+        local miss = l.missing or 0
+        local mapOnly = l.buy and miss > 0 and (l.buy.src or ""):find("marchand") and not (ns.PrixHV and ns.PrixHV(l.buy.id))
+            and not (MerchantFrame and MerchantFrame:IsShown()) and true or false
+        l._map = mapOnly
+        if l.buy and miss > 0 then
+            toPay = toPay + (l.cost or 0)
+            if not mapOnly then clicks = clicks + 1 end
+        end
+    end
+    for i, row in ipairs(f.needs) do
+        local l = mNeeds[mNeedOffset + i]
+        row.line = l
+        if l then
+            local miss = l.missing or 0
+            local _, _, _, _, ic = ItemInfo(l.id or 0)
+            row.icon:SetTexture(ic or "Interface\\Icons\\INV_Misc_QuestionMark")
+            local split = l.id and where[l.id] and #where[l.id] > 1 and (" |cff5f8a99(" .. table.concat(where[l.id], " + ") .. ")|r") or ""
+            row.name:SetText(l.name .. split)
+            row.name:SetTextColor(unpack(l.recipe and Hc.ORANGE or Hc.TEXT))
+            local txt
+            if l.recipe then
+                txt = l.price or ""
+            else
+                txt = string.format("|cff9fbfccil faut %d · tu as %d|r", l.need or 0, math.min(l.have or 0, l.need or 0))
+                if l.note then txt = txt .. " |cff5f8a99(" .. l.note .. ")|r" end
+                txt = txt .. (miss > 0 and (" · |cffffb054manque " .. miss .. "|r " .. (l.priceOnly or "")) or " · |cff5cffb0ok|r")
+            end
+            row.info:SetText(txt)
+            row.mapMode = l._map
+            if l.buy and miss > 0 then
+                row.buy:SetLabel(l._map and "Carte" or (l.buy.kind == "recipe" and "Acheter" or ("Acheter " .. miss)))
+                row.buy:SetWidth(row.buy.label:GetStringWidth() + 16)
+                row.buy:Show()
+            else
+                row.buy:Hide()
+            end
+            row:Show()
+        else
+            row:Hide()
+        end
+    end
     local money = GetMoney()
     f.pay:SetText("À acheter : " .. Money(toPay))
     local after = money - toPay
@@ -1159,7 +1245,9 @@ function F.RefreshMetiers(keepList)
 end
 
 local function SelectRecipe(e)
-    if mSel ~= e and (not mSel or mSel.spell ~= e.spell) then mWant = 1 end
+    if mSel ~= e and (not mSel or mSel.spell ~= e.spell) then
+        mWant, mFolded, mTreeOffset, mNeedOffset = 1, {}, 0, 0
+    end
     mSel = e
     DrawList()
     DrawFiche()
@@ -1392,11 +1480,38 @@ function F.CreateMetiersScreen(parent)
     -- Onglets des métiers + « Monter le métier ».
     Mt.tabs = {}
     for i = 1, 8 do
-        local b = Hc.Button(parent, "", 118, 32, "outline")
+        local b = Hc.Button(parent, "", 108, 32, "outline")
         b.label:SetFont(Hc.FONT, 13, "")
-        b:SetPoint("TOPLEFT", PAD + (i - 1) * 124, -66)
-        b:SetScript("OnClick", function(self) mProf = self.prof; mSel = nil; mOffset = 0; F.RefreshMetiers() end)
+        b:SetPoint("TOPLEFT", PAD + (i - 1) * 113, -66)
+        b:SetScript("OnClick", function(self) mProf = self.prof; mSel = nil; mOffset = 0; mLevel = nil; F.RefreshMetiers() end)
         Mt.tabs[i] = b
+    end
+    -- « Niv. » : niveau simulé du métier affiché (orange quand ce n'est pas ton vrai niveau) ; − / + de 5 en 5.
+    local lvlLabel = Hc.Label(parent, "Niv.", 11, { 0.5, 0.64, 0.7 })
+    lvlLabel:SetPoint("TOPLEFT", PAD + 8 * 113 + 6, -76)
+    local lvMinus = Hc.Button(parent, "-", 22, 32, "muted"); lvMinus:SetPoint("LEFT", lvlLabel, "RIGHT", 6, 0)
+    Mt.level = NumberBox(parent, 46, 32, 15, function()
+        local v = tonumber(Mt.level.edit:GetText())
+        if v and v >= 1 then mLevel = math.min(300, v); mSel = nil; mOffset = 0; F.RefreshMetiers() end
+    end)
+    Mt.level:SetPoint("LEFT", lvMinus, "RIGHT", 2, 0)
+    Mt.level.edit:SetJustifyH("CENTER")
+    local lvPlus = Hc.Button(parent, "+", 22, 32, "muted"); lvPlus:SetPoint("LEFT", Mt.level, "RIGHT", 2, 0)
+    local function Step(d)
+        if not mProf then return end
+        local cur = mLevel or API().LevelOf(mProf)
+        local v = math.max(1, math.min(300, (d > 0 and (math.floor(cur / 5) + 1) * 5) or (math.ceil(cur / 5) - 1) * 5))
+        mLevel = (v ~= API().LevelOf(mProf)) and v or nil
+        mSel = nil; mOffset = 0
+        F.RefreshMetiers()
+    end
+    lvMinus:SetScript("OnClick", function() Step(-1) end)
+    lvPlus:SetScript("OnClick", function() Step(1) end)
+    for _, w in ipairs({ lvMinus, lvPlus }) do
+        w:HookScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_TOP"); GameTooltip:AddLine("Voir les recettes à ce niveau du métier"); GameTooltip:Show()
+        end)
+        w:HookScript("OnLeave", function() GameTooltip:Hide() end)
     end
     local monter = Hc.Check(parent, "Monter le métier")
     monter:SetPoint("TOPRIGHT", -PAD - 130, -74)
@@ -1483,8 +1598,8 @@ function F.CreateMetiersScreen(parent)
 
     local qbox = Box(b, fw - 2 * IN, 70)
     qbox:SetPoint("TOPLEFT", IN, -118)
-    local ql = Hc.Label(qbox, "Combien en fabriquer ?", 11, { 0.5, 0.64, 0.7 }); ql:SetPoint("TOPLEFT", 12, -8)
-    local minus = Hc.Button(qbox, "-", 34, 34, "muted"); minus:SetPoint("TOPLEFT", 12, -26)
+    -- (Pas de titre « Combien en fabriquer ? » : le compteur parle de lui-même, demande de Jérémie.)
+    local minus = Hc.Button(qbox, "-", 34, 34, "muted"); minus:SetPoint("LEFT", 12, 0)
     local qe = NumberBox(qbox, 56, 34, 20, function()
         local v = tonumber(f.qtyEdit:GetText())
         if v and v >= 1 then mWant = math.min(200, v); DrawFiche() end
@@ -1508,74 +1623,131 @@ function F.CreateMetiersScreen(parent)
     f.gainNLabel = Hc.Text(qbox, 11, { 0.5, 0.64, 0.7 }); f.gainNLabel:SetPoint("TOPRIGHT", -12, -10); f.gainNLabel:SetJustifyH("RIGHT")
     f.gainN = Hc.Text(qbox, 20, Hc.GREEN); f.gainN:SetPoint("TOPRIGHT", f.gainNLabel, "BOTTOMRIGHT", 0, -6); f.gainN:SetJustifyH("RIGHT")
 
-    -- Tableau des composants.
+    -- Arbre de la recette (gauche) et TOTAL (SACS + BANQUE) (droite). Titres courts (demande de Jérémie : un
+    -- long titre coûte de la place pour rien).
     local tw = fw - 2 * IN
-    local th = CreateFrame("Frame", nil, b)
-    th:SetPoint("TOPLEFT", IN, -200); th:SetSize(tw, 28)
-    local thb = Hc.Tex(th, "BACKGROUND", { 0.039, 0.082, 0.125 }, 1); thb:SetAllPoints()
-    local X_NEED, X_HAVE, X_MISS, X_PRICE, W_PRICE = 290, 350, 410, 426, 166
-    local c1 = Hc.Label(th, "Composant", 11, { 0.5, 0.64, 0.7 }); c1:SetPoint("LEFT", 10, 0)
-    f.colNeed = Hc.Label(th, "Pour 1", 11, { 0.5, 0.64, 0.7 }); f.colNeed:SetPoint("RIGHT", th, "LEFT", X_NEED, 0)
-    local c3 = Hc.Label(th, "Sur toi", 11, { 0.5, 0.64, 0.7 }); c3:SetPoint("RIGHT", th, "LEFT", X_HAVE, 0)
-    local c4 = Hc.Label(th, "Manque", 11, { 0.5, 0.64, 0.7 }); c4:SetPoint("RIGHT", th, "LEFT", X_MISS, 0)
-    local c5 = Hc.Label(th, "Prix du manque", 11, { 0.5, 0.64, 0.7 }); c5:SetPoint("LEFT", th, "LEFT", X_PRICE, 0)
-    f.reag = {}
-    for i = 1, MREAG_ROWS do
-        local r = CreateFrame("Frame", nil, b)
-        r:SetPoint("TOPLEFT", th, "BOTTOMLEFT", 0, -(i - 1) * 40); r:SetSize(tw, 40)
-        local ln = Hc.Tex(r, "BORDER", { 0.071, 0.161, 0.227 }); ln:SetHeight(1); ln:SetPoint("BOTTOMLEFT"); ln:SetPoint("BOTTOMRIGHT")
-        r.name = Hc.Text(r, 14, Hc.TEXT); r.name:SetPoint("TOPLEFT", 10, -4); r.name:SetWidth(X_NEED - 60)
-        r.sub = Hc.Text(r, 11, Hc.SOFT); r.sub:SetPoint("TOPLEFT", r.name, "BOTTOMLEFT", 0, -3)
-        r.need = Hc.Text(r, 14, Hc.TEXT); r.need:SetPoint("RIGHT", r, "LEFT", X_NEED, 0); r.need:SetJustifyH("RIGHT")
-        r.have = Hc.Text(r, 14, Hc.TEXT); r.have:SetPoint("RIGHT", r, "LEFT", X_HAVE, 0); r.have:SetJustifyH("RIGHT")
-        r.miss = Hc.Text(r, 14, Hc.ORANGE); r.miss:SetPoint("RIGHT", r, "LEFT", X_MISS, 0); r.miss:SetJustifyH("RIGHT")
-        r.price = Hc.Text(r, 12, Hc.TEXT); r.price:SetPoint("LEFT", r, "LEFT", X_PRICE, 0); r.price:SetWidth(W_PRICE)
-        r.price:SetWordWrap(true); r.price:SetMaxLines(2)
-        -- Survol d'un prix qui parle de marchand : la liste des marchands (le plus proche en premier).
-        local ph = CreateFrame("Frame", nil, r)
-        ph:SetPoint("LEFT", r, "LEFT", X_PRICE, 0); ph:SetSize(W_PRICE, 38)
-        ph:EnableMouse(true)
-        ph:SetScript("OnEnter", function(self)
-            local l = self:GetParent().line
-            if l and (l.price or ""):find("marchand") then
-                F.VendorTooltip(self, l.buy and l.buy.id or l.id, l.recipe and mSel and mSel.vend or nil, "Vendu par")
-            end
-        end)
-        ph:SetScript("OnLeave", function() GameTooltip:Hide() end)
-        r.all = Hc.Button(r, "Tout", 50, 26, "outline"); r.all:SetPoint("RIGHT", -4, 0)
-        r.one = Hc.Button(r, "Pour 1", 96, 26, "muted"); r.one:SetPoint("RIGHT", r.all, "LEFT", -4, 0)
-        r.all:SetScript("OnClick", function(self)
-            local p = self:GetParent()
-            local l = p.line
-            if not (l and l.buy) then return end
-            if p.mapMode then
-                F.ShowVendor(l.buy.id, l.recipe and mSel and mSel.vend or nil, l.name)
-            else
-                API().BuyLine(l.buy)
-            end
-        end)
-        r.all:HookScript("OnEnter", function(self)
-            local p = self:GetParent()
-            local l = p.line
-            if not (p.mapMode and l and l.buy) then return end
-            F.VendorTooltip(self, l.buy.id, l.recipe and mSel and mSel.vend or nil, "Pas à l'HV · vendu par")
-        end)
-        r.all:HookScript("OnLeave", function() GameTooltip:Hide() end)
-        r.one:SetScript("OnClick", function(self)
-            local p = self:GetParent()
-            local l = p.line
-            if not (l and l.buy) then return end
-            -- Seulement ce qui manque pour UNE fabrication de plus (choix de Jérémie, 08/11).
-            API().BuyLine({ kind = l.buy.kind, id = l.buy.id, need = p.k or 1, have = 0, name = l.buy.name,
-                unit = l.buy.unit, src = l.buy.src })
-        end)
-        r:Hide()
-        f.reag[i] = r
+    local RW = 290
+    local TW = tw - RW - 10
+    local function Head(parent, w)
+        local h = CreateFrame("Frame", nil, parent)
+        h:SetSize(w, 26)
+        local hb = Hc.Tex(h, "BACKGROUND", { 0.039, 0.082, 0.125 }, 1); hb:SetAllPoints()
+        return h
     end
+    local th = Head(b, TW); th:SetPoint("TOPLEFT", IN, -200)
+    -- Tout replier / tout déplier : deux petits boutons (info-bulle pour le sens).
+    local function Mini(txt, tip, fn)
+        local mb = Hc.Button(th, txt, 22, 18, "muted")
+        mb:SetScript("OnClick", fn)
+        mb:HookScript("OnEnter", function(self) GameTooltip:SetOwner(self, "ANCHOR_TOP"); GameTooltip:AddLine(tip); GameTooltip:Show() end)
+        mb:HookScript("OnLeave", function() GameTooltip:Hide() end)
+        return mb
+    end
+    local foldAll = Mini("-", "Tout replier", function()
+        local function F2(nd) if nd.depth > 0 and #nd.kids > 0 then mFolded[nd.key] = true end
+            for _, k in ipairs(nd.kids) do F2(k) end end
+        if Mt.treeRoot then F2(Mt.treeRoot) end
+        mTreeOffset = 0; DrawFiche()
+    end)
+    foldAll:SetPoint("LEFT", 6, 0)
+    local openAll = Mini("+", "Tout déplier", function() mFolded = {}; DrawFiche() end)
+    openAll:SetPoint("LEFT", foldAll, "RIGHT", 4, 0)
+    local hq = Hc.Label(th, "Qté", 11, { 0.5, 0.64, 0.7 }); hq:SetPoint("RIGHT", th, "LEFT", TW - 112, 0)
+    local hm = Hc.Label(th, "Métier", 11, { 0.5, 0.64, 0.7 }); hm:SetPoint("RIGHT", th, "RIGHT", -8, 0)
+    f.tree = {}
+    for i = 1, TREE_ROWS do
+        local r = CreateFrame("Frame", nil, b)
+        r:SetPoint("TOPLEFT", th, "BOTTOMLEFT", 0, -(i - 1) * 26); r:SetSize(TW, 26)
+        r:EnableMouse(true)
+        r.bg = Hc.Tex(r, "BACKGROUND", { 0.051, 0.114, 0.169 }, 1); r.bg:SetAllPoints()
+        local ln = Hc.Tex(r, "BORDER", { 0.059, 0.133, 0.188 }); ln:SetHeight(1); ln:SetPoint("BOTTOMLEFT"); ln:SetPoint("BOTTOMRIGHT")
+        -- Traits d'arborescence : un trait vertical par niveau (entier, ou jusqu'au milieu pour le dernier
+        -- enfant) et un petit trait horizontal vers l'objet.
+        r.g = {}
+        for gi = 1, TREE_GUIDES do
+            local v = Hc.Tex(r, "ARTWORK", Hc.CYAN); v:SetWidth(1)
+            local hz = Hc.Tex(r, "ARTWORK", Hc.CYAN); hz:SetSize(10, 1)
+            hz:SetPoint("LEFT", r, "LEFT", (gi - 1) * TREE_STEP + 8, 0)
+            r.g[gi] = { v = v, h = hz }
+        end
+        r.fold = CreateFrame("Button", nil, r); r.fold:SetSize(14, 14)
+        Hc.Border(r.fold, Hc.CYAN)
+        r.fold.t = Hc.Text(r.fold, 12, Hc.CYAN); r.fold.t:SetPoint("CENTER", 0, 1)
+        r.fold:SetScript("OnClick", function(self)
+            local t = self:GetParent().t
+            if t then mFolded[t.node.key] = not mFolded[t.node.key] or nil; DrawFiche() end
+        end)
+        r.icon = r:CreateTexture(nil, "ARTWORK"); r.icon:SetSize(18, 18)
+        r.qty = Hc.Text(r, 14, Hc.TEXT); r.qty:SetPoint("RIGHT", r, "LEFT", TW - 112, 0); r.qty:SetJustifyH("RIGHT")
+        r.craftBox = CreateFrame("Frame", nil, r); r.craftBox:SetSize(80, 18); r.craftBox:SetPoint("RIGHT", -6, 0)
+        Hc.Border(r.craftBox, Hc.CYAN)
+        r.craft = Hc.Text(r.craftBox, 11, Hc.CYAN); r.craft:SetPoint("CENTER")
+        r.name = Hc.Text(r, 13, Hc.TEXT); r.name:SetPoint("LEFT", r.icon, "RIGHT", 6, 0)
+        r.name:SetPoint("RIGHT", r, "LEFT", TW - 160, 0)
+        r:SetScript("OnEnter", function(self)
+            if not self.t then return end
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT"); GameTooltip:SetItemByID(self.t.node.id); GameTooltip:Show()
+        end)
+        r:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        r:SetScript("OnMouseUp", function(self) if self.t and ns.ShiftLink then ns.ShiftLink(self.t.node.id) end end)
+        r:Hide()
+        f.tree[i] = r
+    end
+    local treeArea = CreateFrame("Frame", nil, b)
+    treeArea:SetPoint("TOPLEFT", th, "BOTTOMLEFT"); treeArea:SetSize(TW, TREE_ROWS * 26)
+    treeArea:EnableMouseWheel(true)
+    treeArea:SetScript("OnMouseWheel", function(_, delta)
+        mTreeOffset = math.max(0, math.min(math.max(0, #mTreeRows - TREE_ROWS), mTreeOffset - delta * 3)); DrawFiche()
+    end)
 
-    f.steps = Hc.Text(b, 12, Hc.SOFT)
-    f.steps:SetPoint("TOPLEFT", th, "BOTTOMLEFT", 0, -(MREAG_ROWS * 40) - 8)
-    f.steps:SetWidth(tw); f.steps:SetWordWrap(true); f.steps:SetMaxLines(2)
+    local nh = Head(b, RW); nh:SetPoint("TOPLEFT", th, "TOPRIGHT", 10, 0)
+    local nl = Hc.Label(nh, "Total (sacs + banque)", 11, { 0.5, 0.64, 0.7 }); nl:SetPoint("LEFT", 8, 0)
+    f.needs = {}
+    for i = 1, NEED_ROWS do
+        local r = CreateFrame("Frame", nil, b)
+        r:SetPoint("TOPLEFT", nh, "BOTTOMLEFT", 0, -(i - 1) * 40); r:SetSize(RW, 40)
+        r:EnableMouse(true)
+        local ln = Hc.Tex(r, "BORDER", { 0.071, 0.161, 0.227 }); ln:SetHeight(1); ln:SetPoint("BOTTOMLEFT"); ln:SetPoint("BOTTOMRIGHT")
+        r.icon = r:CreateTexture(nil, "ARTWORK"); r.icon:SetSize(18, 18); r.icon:SetPoint("TOPLEFT", 6, -4)
+        r.buy = Hc.Button(r, "Acheter", 70, 18, "outline"); r.buy:SetPoint("TOPRIGHT", -4, -3)
+        r.buy.label:SetFont(Hc.FONT, 11, "")
+        r.name = Hc.Text(r, 13, Hc.TEXT); r.name:SetPoint("LEFT", r.icon, "RIGHT", 6, 0)
+        r.name:SetPoint("RIGHT", r.buy, "LEFT", -6, 0)
+        r.info = Hc.Text(r, 11, Hc.SOFT); r.info:SetPoint("TOPLEFT", 8, -24); r.info:SetPoint("RIGHT", r, "RIGHT", -4, 0)
+        r.buy:SetScript("OnClick", function(self)
+            local p = self:GetParent()
+            local l = p.line
+            if not (l and l.buy) then return end
+            if p.mapMode then F.ShowVendor(l.buy.id, l.recipe and mSel and mSel.vend or nil, l.name)
+            else API().BuyLine(l.buy) end
+        end)
+        r.buy:HookScript("OnEnter", function(self)
+            local p = self:GetParent()
+            local l = p.line
+            if p.mapMode and l and l.buy then F.VendorTooltip(self, l.buy.id, l.recipe and mSel and mSel.vend or nil, "Pas à l'HV · vendu par") end
+        end)
+        r.buy:HookScript("OnLeave", function() GameTooltip:Hide() end)
+        r:SetScript("OnEnter", function(self)
+            local l = self.line
+            if not (l and l.id) then return end
+            if (l.priceOnly or l.price or ""):find("marchand") then
+                F.VendorTooltip(self, l.buy and l.buy.id or l.id, l.recipe and mSel and mSel.vend or nil, "Vendu par")
+            else
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT"); GameTooltip:SetItemByID(l.id); GameTooltip:Show()
+            end
+        end)
+        r:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        r:SetScript("OnMouseUp", function(self) if self.line and self.line.id and ns.ShiftLink then ns.ShiftLink(self.line.id) end end)
+        r:Hide()
+        f.needs[i] = r
+    end
+    local needArea = CreateFrame("Frame", nil, b)
+    needArea:SetPoint("TOPLEFT", nh, "BOTTOMLEFT"); needArea:SetSize(RW, NEED_ROWS * 40)
+    needArea:EnableMouseWheel(true)
+    needArea:SetScript("OnMouseWheel", function(_, delta)
+        mNeedOffset = math.max(0, math.min(math.max(0, #mNeeds - NEED_ROWS), mNeedOffset - delta * 2)); DrawFiche()
+    end)
+
     f.pay = Hc.Text(b, 14, Hc.TEXT); f.pay:SetPoint("BOTTOMLEFT", IN, 48)
     f.purse = Hc.Text(b, 13, Hc.SOFT); f.purse:SetPoint("BOTTOMLEFT", IN, 26)
     f.note = Hc.Text(b, 12, Hc.SOFT); f.note:SetPoint("BOTTOMLEFT", IN, 8)
@@ -1584,7 +1756,7 @@ function F.CreateMetiersScreen(parent)
     f.buyAll:SetPoint("BOTTOMRIGHT", -IN, 14)
     f.buyAll:SetScript("OnClick", function()
         -- Chaque clic achète le composant suivant (le jeu exige un clic par achat).
-        for _, l in ipairs(mFiche or {}) do
+        for _, l in ipairs(mNeeds or {}) do
             if l.buy and (l.missing or 0) > 0 and not l._map then API().BuyLine(l.buy) return end
         end
     end)
@@ -1808,13 +1980,14 @@ end
 local function CheckNext()
     enCurrent = table.remove(enQueue, 1)
     if not enCurrent then DrawEncheres() return end
-    if C_AuctionHouse.IsThrottledMessageSystemReady and not C_AuctionHouse.IsThrottledMessageSystemReady() then
+    if (C_AuctionHouse.IsThrottledMessageSystemReady and not C_AuctionHouse.IsThrottledMessageSystemReady())
+        or (ns.HVCanAutoSearch and not ns.HVCanAutoSearch()) then -- limite du jeu : 60 recherches automatiques / min
         table.insert(enQueue, 1, enCurrent); enCurrent = nil
-        C_Timer.After(0.3, CheckNext)
+        C_Timer.After(1, CheckNext)
         return
     end
     local cur = enCurrent
-    C_AuctionHouse.SendSearchQuery(cur.key, { { sortOrder = Enum.AuctionHouseSortOrder.Price, reverseSort = false } }, true)
+    C_AuctionHouse.SendSearchQuery(cur.key, {}, true) -- sans tri, comme TSM
     C_Timer.After(4, function() if enCurrent == cur then enCurrent = nil; CheckNext() end end)
     DrawEncheres()
 end
@@ -2032,6 +2205,7 @@ local OP_ROWS, LADDER_ROWS = 15, 9
 
 local function Ano() return ns.AnoAPI end
 
+local opSortN, opSortGain = -1, {}
 local function OpItems()
     local out, nV, nP = {}, 0, 0
     for _, e in ipairs(Ano() and Ano().Items() or {}) do
@@ -2039,6 +2213,25 @@ local function OpItems()
         if pal then nP = nP + 1 else nV = nV + 1 end
         if opFilter == "all" or (opFilter == "pnj" and not pal) or (opFilter == "palier" and pal) then out[#out + 1] = e end
     end
+    -- Ligne CHOISIE qui n'est plus une affaire : elle reste à sa place tant que tu la consultes (demande de
+    -- Jérémie) ; elle disparaît quand tu en choisis une autre.
+    local keepSel = opSel and opSel.done
+    if keepSel then out[#out + 1] = opSel end
+    -- Trié par la colonne « Gain / clic », le plus gros d'abord (demande de Jérémie). Le gain de chaque ligne est
+    -- FIGÉ jusqu'à ce que la liste change (ligne ajoutée / retirée) : sinon une ligne bougerait après chaque achat
+    -- et le clic suivant tomberait sur un autre objet.
+    local n = #(Ano() and Ano().Items() or {}) + (keepSel and 1 or 0)
+    if n ~= opSortN then opSortN, opSortGain = n, {} end
+    for _, e in ipairs(out) do
+        if not opSortGain[e] then
+            local ok, g = pcall(Ano().NextClickGain, e)
+            opSortGain[e] = (ok and tonumber(g)) or e.unitGain or 0
+        end
+    end
+    table.sort(out, function(a, b)
+        if opSortGain[a] ~= opSortGain[b] then return opSortGain[a] > opSortGain[b] end
+        return (a.name or "") < (b.name or "")
+    end)
     return out, nV, nP
 end
 
@@ -2066,7 +2259,9 @@ local function DrawOpFiche()
 
     -- Échelle des annonces (paliers vérifiés) : la poche en vert, le mur en cyan, ta revente en pointillés.
     local levels = pal and e.levels or nil
-    f.ladderTitle:SetShown(levels ~= nil)
+    local checking = Ano().Checking and Ano().Checking(e)
+    f.ladderTitle:SetText(Hc.Upper(checking and "Lecture des annonces…" or "Les annonces, du moins cher au plus cher"))
+    f.ladderTitle:SetShown(levels ~= nil or checking)
     local rows, maxQ = {}, 1
     if levels then
         local placed = false
@@ -2093,15 +2288,18 @@ local function DrawOpFiche()
                 r.price:SetTextColor(1, 0.91, 0.63)
                 r.dash:Show()
             else
+                -- Sous le mur mais au-dessus du prix d'achat max : pas acheté (moins de 20 % de marge).
                 local kind = (e.maxUnit and l.p <= e.maxUnit) and "pocket"
-                    or ((e.wall and l.p >= e.wall and l.p <= e.wall * 1.25) and "wall" or nil)
+                    or ((e.wall and l.p >= e.wall and l.p <= e.wall * 1.25) and "wall")
+                    or ((e.resale and l.p < e.resale) and "dear" or nil)
                 local c = kind == "pocket" and Hc.GREEN or (kind == "wall" and Hc.CYAN or { 0.165, 0.31, 0.388 })
                 r.bar:SetColorTexture(c[1], c[2], c[3], 1)
                 r.bar:SetWidth(math.max(3, barW * l.q / maxQ))
                 r.bar:Show()
                 r.qty:SetText(l.q)
-                r.label:SetText(kind == "pocket" and "la poche" or (kind == "wall" and "le mur" or ""))
-                r.label:SetTextColor(c[1], c[2], c[3])
+                r.label:SetText(kind == "pocket" and "tu achètes" or (kind == "wall" and "le mur"
+                    or (kind == "dear" and "trop cher" or "")))
+                if kind == "dear" then r.label:SetTextColor(unpack(Hc.SOFT)) else r.label:SetTextColor(c[1], c[2], c[3]) end
                 r.price:SetTextColor(unpack(Hc.TEXT))
                 r.dash:Hide()
             end
@@ -2109,6 +2307,21 @@ local function DrawOpFiche()
         else
             r:Hide()
         end
+    end
+
+    -- Annonces moins chères que ta revente que tu n'achètes pas : elles se vendront AVANT les tiennes.
+    local ahead = 0
+    for _, l in ipairs(levels or {}) do
+        if e.resale and l.p < e.resale and not (e.maxUnit and l.p <= e.maxUnit) then ahead = ahead + l.q end
+    end
+    if ahead > 0 then
+        local mine = e.qty or 1
+        local days = e.perDay and e.perDay > 0 and (ahead + mine) / e.perDay or nil
+        f.warn:SetText(string.format("%d moins chères que ta revente restent devant toi%s.", ahead,
+            days and string.format(" : env. %s jour%s pour tout vendre", Num(days), days >= 2 and "s" or "") or ""))
+        f.warn:Show()
+    else
+        f.warn:Hide()
     end
 
     -- Tu paies / Tu touches / Gain visé (pour ce que le prochain clic achète).
@@ -2127,6 +2340,10 @@ local function DrawOpFiche()
 
     local label, enabled = Ano().ButtonText()
     if entry ~= e then label, enabled = (e.blocked and "Achats arrêtés" or "Acheter"), not e.blocked end
+    if e.done then
+        label, enabled = "Plus d'affaire", false
+        f.t1:SetText("-"); f.t1s:SetText(""); f.t2:SetText("-"); f.t2s:SetText(""); f.t3:SetText("-")
+    end
     f.buy:SetLabel(label)
     f.buy:SetEnabled(enabled and true or false)
     f.note:SetText(Ano().IsCommodity(e.id) and "arrive par courrier"
@@ -2170,6 +2387,12 @@ local function DrawOpportunites()
             local g = Ano().NextClickGain(e) or e.unitGain or 0
             r.gain:SetText("+" .. Money(math.max(0, g)) .. (e.qty and "" or " |cff9fbfcc/u|r"))
             local label, enabled = Ano().RowButtonText(e)
+            if e.done then -- (ligne gardée parce que tu la consultes)
+                r.type:SetText("PLUS D'AFFAIRE")
+                r.type:SetTextColor(unpack(Hc.SOFT))
+                r.gain:SetText("|cff9fbfcc-|r")
+                label, enabled = "-", false
+            end
             r.buy:SetLabel(label)
             r.buy:SetEnabled(enabled and true or false)
             r.sel:SetShown(opSel == e or entry == e)
@@ -2178,7 +2401,6 @@ local function DrawOpportunites()
             r:Hide()
         end
     end
-    if opSel and opSel.done then opSel = nil end
     DrawOpFiche()
 end
 ns.OnAnoUpdate = function()
@@ -2266,6 +2488,7 @@ function F.CreateOpportunitesScreen(parent)
             if not self.e then return end
             if ns.ShiftLink and ns.ShiftLink(self.e.id) then return end
             opSel = self.e
+            if Ano().Verify then Ano().Verify(self.e) end -- priorité à ce que tu regardes
             DrawOpportunites()
         end)
         r:SetScript("OnEnter", function(self)
@@ -2307,6 +2530,9 @@ function F.CreateOpportunitesScreen(parent)
         r:Hide()
         f.ladder[i] = r
     end
+    f.warn = Hc.Text(bd, 12, Hc.ORANGE)
+    f.warn:SetPoint("TOPLEFT", IN, -100 - (LADDER_ROWS + 1) * 28 - 10); f.warn:SetWidth(ficheW - 2 * IN)
+    f.warn:SetJustifyH("LEFT")
     local tw = math.floor((ficheW - 2 * IN - 16) / 3)
     local function Tile(i, label, color)
         local b = Box(bd, tw, 64)
@@ -2422,6 +2648,7 @@ local function DrawMesVentes()
             r.profit:SetText((s.profit >= 0 and "+" or "-") .. Money(math.abs(math.floor(s.profit))))
             r.profit:SetTextColor(unpack(s.profit >= 0 and Hc.GREEN or Hc.RED))
             r.exp:SetText((s.expires or 0) > 0 and s.expires or "")
+            r.dep:SetText((s.depotPerdu or 0) > 0 and ("-" .. Money(math.floor(s.depotPerdu))) or "")
             r.live:SetText((s.enCours or 0) > 0 and s.enCours or "")
             r:Show()
         else
@@ -2476,13 +2703,16 @@ function F.CreateMesVentesScreen(parent)
     head:SetPoint("TOPLEFT", 1, -1); head:SetPoint("TOPRIGHT", -1, -1); head:SetHeight(30)
     local hb = Hc.Tex(head, "BACKGROUND", { 0.039, 0.082, 0.125 }, 1); hb:SetAllPoints()
     -- Bords droits des colonnes (Origine : bord gauche) ; l'objet prend le reste.
-    local C = { sold = 460, delay = 550, netu = 670, costu = 790, origin = 810, profit = 1010, exp = 1090, live = 1180 }
+    -- Ordre de lecture : ce que tu touches, ce que ça t'a coûté, ce que les invendus t'ont fait perdre, le bénéfice.
+    local C = { sold = 420, delay = 500, netu = 610, costu = 720, origin = 740, exp = 880, dep = 1000, profit = 1100,
+        live = 1180 }
     local function H1(text, x, left)
         local h = Hc.Label(head, text, 11, { 0.5, 0.64, 0.7 })
         if left then h:SetPoint("LEFT", head, "LEFT", x, 0) else h:SetPoint("RIGHT", head, "LEFT", x, 0) end
     end
     H1("Objet", 12, true); H1("Vendus", C.sold); H1("Délai", C.delay); H1("Net / u", C.netu); H1("Coût / u", C.costu)
-    H1("Origine", C.origin, true); H1("Bénéfice", C.profit); H1("Invendus", C.exp); H1("En vente", C.live)
+    H1("Origine", C.origin, true); H1("Invendus", C.exp); H1("Dépôts perdus", C.dep); H1("Bénéfice", C.profit)
+    H1("En vente", C.live)
     Mv.rows = {}
     for i = 1, MV2_ROWS do
         local r = CreateFrame("Frame", nil, t)
@@ -2499,6 +2729,7 @@ function F.CreateMesVentesScreen(parent)
         r.sold = Cell(C.sold); r.delay = Cell(C.delay, Hc.SOFT); r.netu = Cell(C.netu); r.costu = Cell(C.costu, Hc.SOFT)
         r.origin = Hc.Text(r, 12, Hc.SOFT); r.origin:SetPoint("LEFT", r, "LEFT", C.origin, 0)
         r.profit = Cell(C.profit, Hc.GREEN, 15); r.exp = Cell(C.exp, Hc.ORANGE); r.live = Cell(C.live, Hc.SOFT)
+        r.dep = Cell(C.dep, Hc.ORANGE)
         r:SetScript("OnEnter", function(self)
             if not self.s then return end
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT"); GameTooltip:SetItemByID(self.s.id); GameTooltip:Show()
@@ -2566,7 +2797,35 @@ local function ResultInfo(r)
         quality = (okI and ki and ki.quality) or quality, commodity = okI and ki and ki.isCommodity or false,
         market = market, perDay = ns.TSM and ns.TSM("DBRegionSoldPerDay", id) }
     if market and market > 0 and e.price > 0 then e.ecart = (e.price - market) / market end
+    -- Objet pas encore chargé par le jeu (« objet 2679 », vu le 09/11) : on lui demande, et la ligne est
+    -- complétée à l'arrivée de l'info (GET_ITEM_INFO_RECEIVED → F.AcItemInfo).
+    if not ((okI and ki and ki.itemName) or name) then
+        e.loading = true
+        if C_Item and C_Item.RequestLoadItemDataByID then pcall(C_Item.RequestLoadItemDataByID, id) end
+    end
     return e
+end
+
+-- Info d'un objet arrivée : les lignes de résultats qui l'attendaient sont complétées (un seul redessin groupé).
+local acInfoTimer
+function F.AcItemInfo(itemID)
+    local hit = false
+    for _, e in ipairs(acResults) do
+        if e.loading and e.id == itemID then
+            local okI, ki = pcall(C_AuctionHouse.GetItemKeyInfo, e.itemKey)
+            local name, _, quality, _, icon = ItemInfo(itemID)
+            e.name = (okI and ki and ki.itemName) or name or e.name
+            e.icon = (okI and ki and ki.iconFileID) or icon or e.icon
+            e.quality = (okI and ki and ki.quality) or quality or e.quality
+            if okI and ki and ki.isCommodity ~= nil then e.commodity = ki.isCommodity end
+            e.loading = (okI and ki and ki.itemName) == nil and name == nil
+            hit = true
+        end
+    end
+    if hit and not acInfoTimer then
+        acInfoTimer = true
+        C_Timer.After(0.2, function() acInfoTimer = nil; if F.RefreshAcheter then F.RefreshAcheter() end end)
+    end
 end
 
 local function ReadBrowse()
@@ -2708,7 +2967,7 @@ local function SearchListings()
         return
     end
     acListings, acPick = nil, nil
-    C_AuctionHouse.SendSearchQuery(acSel.itemKey, { { sortOrder = Enum.AuctionHouseSortOrder.Price, reverseSort = false } }, true)
+    C_AuctionHouse.SendSearchQuery(acSel.itemKey, {}, true) -- sans tri, comme TSM
     DrawAcheter()
 end
 
@@ -3075,7 +3334,7 @@ local function Create()
     top:EnableMouse(true); top:RegisterForDrag("LeftButton")
     top:SetScript("OnDragStart", function() win:StartMoving() end)
     top:SetScript("OnDragStop", function() win:StopMovingOrSizing() end)
-    local brand = Hc.Label(top, "EryAddon · Hôtel des ventes", 16, Hc.CYAN); brand:SetPoint("LEFT", 20, 0)
+    local brand = Hc.Label(top, "FDC · Hôtel des ventes", 16, Hc.CYAN); brand:SetPoint("LEFT", 20, 0)
     local unused
     win.scanChip = Chip(top, brand, 16)
     win.tsmChip, unused, win.tsmDot = Chip(top, win.scanChip, 8)
@@ -3092,19 +3351,9 @@ local function Create()
     win.gold = Hc.Text(goldBox, 14, Hc.TEXT); win.gold:SetPoint("CENTER")
     local game = Hc.Button(top, "Interface du jeu", 150, 32, "muted")
     game:SetPoint("RIGHT", goldBox, "LEFT", -10, 0)
-    -- Les scans (ils servent à tous les écrans), comme la colonne de droite de l'interface du jeu.
-    local global = Hc.Button(top, "Scan global", 120, 32, "muted")
-    global:SetPoint("RIGHT", game, "LEFT", -18, 0)
-    global:SetScript("OnClick", function() if ns.AnoAPI then ns.AnoAPI.StartGlobalScan() end; UpdateTop() end)
-    global:HookScript("OnEnter", function(self)
-        GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
-        GameTooltip:AddLine("Scan global")
-        GameTooltip:AddLine("Scan + étude du marché de tous les objets (environ 1 h). Fermer l'HV l'arrête.", 1, 1, 1, true)
-        GameTooltip:Show()
-    end)
-    global:HookScript("OnLeave", function() GameTooltip:Hide() end)
+    -- Le scan (il sert à tous les écrans), comme la colonne de droite de l'interface du jeu.
     local scan = Hc.Button(top, "Scanner l'HV", 130, 32, "solid")
-    scan:SetPoint("RIGHT", global, "LEFT", -8, 0)
+    scan:SetPoint("RIGHT", game, "LEFT", -18, 0)
     scan:SetScript("OnClick", function() if ns.AnoAPI then ns.AnoAPI.StartScan() end; UpdateTop() end)
     game:SetScript("OnClick", function()
         EryAddonDB.hvFenetre = false
@@ -3199,11 +3448,15 @@ for _, e in ipairs({ "AUCTION_HOUSE_SHOW", "AUCTION_HOUSE_CLOSED", "COMMODITY_SE
     "ITEM_SEARCH_RESULTS_UPDATED", "BAG_UPDATE_DELAYED", "AUCTION_HOUSE_AUCTION_CREATED", "PLAYER_MONEY",
     "UI_ERROR_MESSAGE", "OWNED_AUCTIONS_UPDATED", "AUCTION_CANCELED", "MAIL_INBOX_UPDATE",
     "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED", "AUCTION_HOUSE_BROWSE_RESULTS_ADDED",
-    "COMMODITY_PURCHASE_SUCCEEDED", "COMMODITY_PURCHASE_FAILED" }) do
+    "COMMODITY_PURCHASE_SUCCEEDED", "COMMODITY_PURCHASE_FAILED", "GET_ITEM_INFO_RECEIVED" }) do
     pcall(ev.RegisterEvent, ev, e)
 end
 local OnEvent
 OnEvent = function(_, event, ...)
+    if event == "GET_ITEM_INFO_RECEIVED" then
+        if F.AcItemInfo then F.AcItemInfo((...)) end
+        return
+    end
     if event == "AUCTION_HOUSE_SHOW" then
         C_Timer.After(0, function()
             CreateOpenButton()

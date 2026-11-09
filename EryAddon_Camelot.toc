@@ -1,8 +1,8 @@
 ## Interface: 16001
-## Title: EryAddon
-## Notes: Hôtel des ventes, métiers et plus (client français). Tapez /eryaddon pour activer ou désactiver chaque fonction.
+## Title: FDC - Federytion Du Commerce
+## Notes: Hôtel des ventes, métiers et plus (client français). Tapez /fdc pour activer ou désactiver chaque fonction.
 ## Author: Jérémie
-## Version: 0.53.0
+## Version: 0.54.0
 ## SavedVariables: EryAddonDB
 ## X-Curse-Project-ID: 1791316
 

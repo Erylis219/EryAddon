@@ -19,10 +19,11 @@ local HV = {
 table.insert(ns.features, HV)
 ns.DEFAULTS.hvAnomalies = true
 
-local PRICE_SORT = { {
-    sortOrder = (Enum.AuctionHouseSortOrder and Enum.AuctionHouseSortOrder.Price) or 0, -- tri par prix
-    reverseSort = false,
-} }
+-- Recherches d'objet SANS tri, exactement comme TSM (LibTSMWoW, AuctionHouseWrapper : EMPTY_SORTS_TABLE), qui
+-- marche sur Forever. 09/11 : avec un tri par prix, des objets NON empilables (armes, plans : clé avec niveau
+-- d'objet) restaient sans réponse et bloquaient l'HV. Le code retrie lui-même les annonces (ItemQueue,
+-- PalierFromLevels…) ; les marchandises arrivent de toute façon de la moins chère à la plus chère.
+local PRICE_SORT = {}
 
 ---------------------------------------------------------------------------
 -- Petits outils
@@ -107,14 +108,11 @@ local UpdateWindow -- défini plus bas
 local scanRunning = false
 local scanResults, scanToken = {}, 0
 local scanQty = {} -- [objet] = quantité en vente
-local scanKeys, lastScanKeys = {}, {} -- [objet] = clé de recherche vue au scan (pour l'étude du marché)
+local scanKeys, lastScanKeys = {}, {} -- [objet] = clé de recherche vue au scan (recherches ciblées)
 local statusText = ""
--- Version COURTE de l'état (« EDM 71/3711 », « Scan : 1200 objets »), affichée sous les boutons de scan
+-- Version COURTE de l'état (« Vérif. 3/12 », « Scan : 1200 objets »), affichée sous les boutons de scan
 -- collés à droite de l'HV (demande de Jérémie). sideStatus = le texte, créé avec les onglets.
 local shortText, sideStatus = "", nil
--- Scan global (demande de Jérémie : « tout scanner, avant d'aller me coucher, même si ça dure 1 h ») :
--- scan + étude du marché de TOUS les objets de l'HV, sans la limite de 10 min ni l'âge minimal du relevé.
-local globalMode = false
 
 local function UpdateSide()
     if not sideStatus then return end
@@ -135,7 +133,6 @@ local function SetStatus(text, short)
 end
 
 local StartDetails -- défini plus bas : vérification des quantités après le scan
-local SaveStudyKeys -- défini plus bas : clés de recherche de l'étude du marché
 
 -- Liste affichée PENDANT le scan (demande de Jérémie) : chaque page reçue ajoute
 -- tout de suite ses anomalies. liveSeen[id] = la ligne, ou false si l'objet a été
@@ -171,9 +168,9 @@ end
 ---------------------------------------------------------------------------
 -- PALIERS (08/11, idée de Jérémie : 2 Délices de déviant à 38 pa sous 64 à 56 pa, achetés puis
 -- revendus). Une « poche » d'annonces bradées sous un « mur » d'annonces au même prix : on achète la
--- poche, on revend 1 pa sous le mur. Ces lignes entrent dans Anomalies (kind = "palier") et passent par
+-- poche, on revend 1 pc sous le mur (1 pa pour un objet non empilable). Ces lignes entrent dans Anomalies (kind = "palier") et passent par
 -- le même circuit (vérification, achat express, file d'enchères) ; pour elles, e.vendor = revente NETTE
--- à l'HV visée (mur − 1 pa, − 5 %), e.maxUnit = prix d'achat maximum, e.capQty = quantité maximum.
+-- à l'HV visée (mur − 1 pc ou 1 pa, − 5 %), e.maxUnit = prix d'achat maximum, e.capQty = quantité maximum.
 -- Chiffres de référence : TSM (ns.TSM, EryAddon.lua). Sans TSM : pas de paliers.
 -- Règles (étude du 08/11 + réglages par défaut de TSM lus dans son code) :
 --   - candidat au scan : se vend (≥ 1 / jour par HV, ≥ 30 % des annonces partent) et prix le plus bas
@@ -182,7 +179,10 @@ end
 --   - revente plafonnée à 1,3 x la référence : un mur à 2 x ou 5 x le prix du marché est souvent posé
 --     par TSM sur un marché vide (ses prix « normal » et « max »), pas de vrais acheteurs ;
 --   - 1 pa sous le mur (le jeu n'accepte que des prix ronds à la pièce d'argent) : devant tous les vendeurs TSM, qui s'alignent sans passer dessous ;
---   - 20 % de marge par exemplaire, 5 pa de gain au moins, 2 jours de ventes au plus.
+--   - RÈGLE DE JÉRÉMIE (09/11) : « on ne met jamais en vente si on n'est pas le moins cher » → on achète TOUTE
+--     la poche (toutes les annonces sous le mur), sinon les annonces laissées seraient vendues avant nous ;
+--     poche plus grande que 2 jours de ventes ou plus chère que ta bourse : pas de palier ;
+--   - 20 % de marge sur le LOT entier, 5 pa de gain au moins.
 ---------------------------------------------------------------------------
 local PALIER_COMMISSION = 0.05
 local PALIER_MARGE = 1.2         -- revente nette ≥ 1,2 x prix d'achat
@@ -224,7 +224,7 @@ end
 
 -- Paliers d'une liste d'annonces { {p = prix unitaire, q = quantité}, … } (les siennes exclues).
 -- Renvoie nil, ou { resale (prix de mise en vente), net, maxUnit, qty, cost, gain, wall, wallQty }.
-local function PalierFromLevels(levels, ref, perDay)
+local function PalierFromLevels(levels, ref, perDay, unique)
     table.sort(levels, function(a, b) return a.p < b.p end)
     local cap = math.max(1, math.floor((perDay or 0) * PALIER_JOURS))
     local best
@@ -236,19 +236,23 @@ local function PalierFromLevels(levels, ref, perDay)
         end
         for k = 1, j - 1 do pocket = pocket + levels[k].q end
         if solid >= PALIER_MUR_MIN and pocket * 2 <= solid then
-            -- Prix de mise en vente : pièces d'argent entières seulement (le jeu refuse 67 pa 99, accepte 68 pa).
-            local resale = math.min(math.ceil(wall / 100) * 100 - 100, math.floor(ref * PALIER_PLAFOND / 100) * 100)
-            local net = math.floor(resale * (1 - PALIER_COMMISSION))
-            local maxUnit = math.floor(net / PALIER_MARGE)
-            local qty, cost = 0, 0
-            for k = 1, j - 1 do
-                local l = levels[k]
-                if l.p > maxUnit or qty >= cap then break end
-                local n = math.min(l.q, cap - qty)
-                qty, cost = qty + n, cost + n * l.p
+            -- Prix de mise en vente : objet non empilable = pièces d'argent entières seulement (le jeu refuse
+            -- 67 pa 99, accepte 68 pa) → 1 pa sous le mur ; empilable : le cuivre passe → 1 pc sous le mur.
+            local resale
+            if unique then
+                resale = math.min(math.ceil(wall / 100) * 100 - 100, math.floor(ref * PALIER_PLAFOND / 100) * 100)
+            else
+                resale = math.min(wall - 1, math.floor(ref * PALIER_PLAFOND))
             end
+            local net = math.floor(resale * (1 - PALIER_COMMISSION))
+            -- Toute la poche (règle « toujours le moins cher ») : prix d'achat max = l'annonce la plus chère
+            -- sous le mur ; la marge se juge sur le lot.
+            local maxUnit = levels[j - 1].p
+            local qty, cost = 0, 0
+            for k = 1, j - 1 do qty, cost = qty + levels[k].q, cost + levels[k].q * levels[k].p end
             local gain = net * qty - cost
-            if qty > 0 and (not best or gain > best.gain) then
+            local money = GetMoney and GetMoney() or math.huge
+            if qty <= cap and cost <= money and (not best or gain > best.gain) then
                 best = { resale = resale, net = net, maxUnit = maxUnit, qty = qty, cost = cost, gain = gain,
                     wall = wall, wallQty = solid, cap = cap }
             end
@@ -389,30 +393,68 @@ local function AddBrowseResults(results)
     if changed then SortByUnitGain(liveList) end
 end
 
--- Seule l'étude du marché (annonces suivies) compte. L'ancienne estimation par baisse de quantité
--- entre deux scans donnait n'importe quoi (« Acide sulfurique : 2 984 ventes par jour ») : la quantité
--- lue par le scan varie sans qu'il y ait de vente. Elle est abandonnée.
--- 08/11 : TSM d'abord (ventes par jour et par HV de la région Forever) : notre étude comptait ~9 fois
--- trop (remises en vente prises pour des ventes ; comparaison faite sur 389 objets). L'étude reste en
--- secours pour les objets que TSM ne connaît pas.
+-- 09/11 : TSM SEUL (ventes par jour et par HV de la région Forever). Notre étude du marché comptait ~9 fois
+-- trop et bloquait l'HV : RETIRÉE (décision de Jérémie). Objet inconnu de TSM : nil (« ventes inconnues »).
 function ns.HVSalesPerDay(itemID)
-    local tsm = ns.TSM and ns.TSM("DBRegionSoldPerDay", itemID)
-    if tsm then return tsm end
-    local st = ns.MarketState and ns.MarketState(itemID)
-    if st and st.parJour then return st.parJour end
-    return nil
+    return ns.TSM and ns.TSM("DBRegionSoldPerDay", itemID) or nil
 end
 
--- Marché mort (objet qui ne se vend pas à l'HV) : moins d'une vente tous les 10 jours d'après TSM,
--- sinon l'étude du marché (aucune vente sur 8 h observées).
+-- Marché mort (objet qui ne se vend pas à l'HV) : moins d'une vente tous les 10 jours d'après TSM.
 function ns.MarketDead(itemID)
     local tsm = ns.TSM and ns.TSM("DBRegionSoldPerDay", itemID)
-    if tsm then return tsm < 0.1 end
-    local st = ns.MarketState and ns.MarketState(itemID)
-    return (st and st.etat == "mort") and true or false
+    return tsm ~= nil and tsm < 0.1
 end
 
 -- Page suivante, ou fin du scan quand le serveur a tout envoyé.
+-- 1re demande du scan (une seule table : le fichier frôle la limite de 200 variables locales de Lua) :
+-- first = 1re page pas encore reçue, try = essai en cours.
+local SQ = { first = false, try = 1, TRIES = 4, seq = 0, times = {}, lost = 0 }
+-- RÈGLE (09/11, Jérémie : « il faut que ce soit robuste ») : l'HV ne sert qu'UNE demande à la fois et ne livre
+-- que la réponse à la DERNIÈRE. Donc :
+--   - SQ.seq compte toutes les recherches d'objet envoyées (les nôtres, un clic, Blizzard…) : la vérification
+--     sait quand une autre lui a pris sa réponse (DetailNext) ;
+--   - TON ACTION PASSE EN PREMIER : une recherche ou un achat pendant le scan page par page MET LE SCAN EN PAUSE
+--     (vécu : clic pendant le scan → ses relances de page volaient la réponse du clic : tout figé), puis il
+--     REPREND tout seul 3 s après ta dernière action (demande de Jérémie : « reprendre là où on en était ») ;
+--     si le jeu a perdu le fil des pages, il repart du début en gardant tout ce qui est déjà lu (SQ.TryResume) ;
+--   - limite du jeu (lue dans TSM : 100 recherches d'objet par minute) : nos recherches AUTOMATIQUES
+--     (vérification, survol, Mes enchères) s'arrêtent à 60 par minute (SQ.CanAuto).
+function SQ.PauseForUser()
+    SQ.lastUser = GetTime()
+    if not scanRunning or SQ.paused then return end
+    SQ.paused = true
+    scanToken = scanToken + 1 -- les relances programmées du scan s'annulent
+    SetStatus("Scan en pause : ton action passe d'abord. Il reprend tout seul juste après.", "Scan en pause")
+    C_Timer.After(1, function() if SQ.TryResume then SQ.TryResume() end end)
+end
+-- CAUSE des objets « muets » (mouchard du 09/11 18:58 : des objets sans réponse au 1er essai ont répondu au
+-- réessai AVEC LA MÊME CLÉ ; les événements montrent la file du jeu, THROTTLED_MESSAGE_QUEUED / SENT) : nos
+-- recherches partaient sans attendre que le jeu soit prêt, et certaines étaient jetées. Comme TSM : on attend.
+function SQ.Ready()
+    return not C_AuctionHouse.IsThrottledMessageSystemReady or C_AuctionHouse.IsThrottledMessageSystemReady()
+end
+function SQ.CanAuto()
+    local now, keep = GetTime(), {}
+    for _, t in ipairs(SQ.times) do if now - t < 60 then keep[#keep + 1] = t end end
+    SQ.times = keep
+    return #keep < 60
+end
+ns.HVCanAutoSearch = function() return SQ.CanAuto() end
+-- Toute demande à l'HV compte dans SQ.seq (vécu 18:40 : un achat de Bauxite pendant la vérification lui a pris
+-- sa réponse → faux « muet ») ; les recherches d'objet comptent aussi pour la limite du jeu ; une action de ta
+-- part (recherche, achat, enchère) met le scan en pause. (Nos propres pages de scan ne le mettent pas en pause.)
+local USER_CALLS = { SendSearchQuery = true, SendSellSearchQuery = true, StartCommoditiesPurchase = true,
+    ConfirmCommoditiesPurchase = true, PlaceBid = true }
+for _, fn in ipairs({ "SendSearchQuery", "SendSellSearchQuery", "StartCommoditiesPurchase", "ConfirmCommoditiesPurchase",
+    "PlaceBid", "QueryOwnedAuctions", "CancelAuction", "PostItem", "PostCommodity" }) do
+    if C_AuctionHouse and C_AuctionHouse[fn] then
+        hooksecurefunc(C_AuctionHouse, fn, function()
+            SQ.seq = SQ.seq + 1
+            if fn == "SendSearchQuery" or fn == "SendSellSearchQuery" then SQ.times[#SQ.times + 1] = GetTime() end
+            if USER_CALLS[fn] then SQ.PauseForUser() end
+        end)
+    end
+end
 local function NextPage()
     if C_AuctionHouse.HasFullBrowseResults() then
         -- Objets pas encore regardés (infos non chargées pendant le scan).
@@ -422,7 +464,6 @@ local function NextPage()
         end
         -- Tous les prix du scan (prix le plus bas + quantité en vente), gardés pour
         -- l'étude des métiers (EryAddon_Metiers.lua, analysée par Claude).
-        EryAddonDB.hvEcoul = nil -- ancienne estimation entre deux scans : abandonnée (voir ns.HVSalesPerDay)
         EryAddonDB.hvPrix = { date = date("%d/%m/%Y %H:%M"), t = time(), prix = scanResults, quantites = scanQty }
         -- Dernier prix VU de chaque objet, gardé d'un scan à l'autre (même s'il n'est plus en vente ensuite) :
         -- la fonction « base de prix » d'Auctionator, recopiée (ns.PrixHV s'en sert ; règle : pas d'Auctionator).
@@ -431,7 +472,6 @@ local function NextPage()
         for id, p in pairs(scanResults) do EryAddonDB.hvVu[id] = { p = p, t = now } end
         if ns.JobsRefresh then ns.JobsRefresh() end -- nouveaux prix : Jobs et guide recalculés
         lastScanKeys = scanKeys
-        pcall(SaveStudyKeys)
         scanResults, scanQty, scanKeys = {}, {}, {}
         FinishScan(missing, 1)
         return
@@ -440,46 +480,94 @@ local function NextPage()
     for _ in pairs(scanResults) do count = count + 1 end
     SetStatus(string.format("Scan en cours : %d objets lus, %d anomalies…", count, #liveList),
         string.format("Scan : %d objets", count))
+    if not SQ.Ready() then C_Timer.After(0.2, NextPage) return end
     scanToken = scanToken + 1
     local token = scanToken
     C_AuctionHouse.RequestMoreBrowseResults()
-    -- Le serveur limite le rythme des demandes : sans réponse, on redemande.
+    -- Le serveur limite le rythme des demandes : sans réponse, on redemande. Deux fois sans réponse : le jeu a
+    -- perdu le fil des pages (une autre demande est passée entre-temps) : on repart du début, en gardant tout ce
+    -- qui est déjà lu (les objets déjà vus ne sont pas recomptés).
     C_Timer.After(5, function()
-        if scanRunning and token == scanToken then NextPage() end
+        if not (scanRunning and token == scanToken) then return end
+        SQ.lost = SQ.lost + 1
+        if SQ.lost >= 2 then
+            SQ.lost, SQ.first = 0, true
+            scanToken = scanToken + 1
+            SetStatus("Scan : reprise de la lecture…", "Scan : reprise")
+            SQ.Send(scanToken, 1, 0)
+        else
+            NextPage()
+        end
     end)
 end
 
 local function OnBrowseEvent(event, added)
     if not scanRunning then return end
+    if SQ.first then
+        SQ.first = false
+        Saved().items = liveList -- le serveur répond : la nouvelle liste remplace l'ancienne
+    end
+    SQ.lost = 0
     if event == "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED" then
         AddBrowseResults(C_AuctionHouse.GetBrowseResults())
     else
         AddBrowseResults(added)
     end
+    if SQ.paused then return end -- en pause : la page suivante sera demandée à la reprise
     NextPage()
+end
+
+-- 1re demande du scan. Bug vécu (09/11, « tout le temps », même à 7 h du matin) : « Le serveur n'a pas
+-- répondu ». Le serveur JETTE une demande envoyée trop tôt après une autre (l'étude du marché ou une recherche
+-- venait de partir) ; on n'essayait qu'une fois. Maintenant : on attend que le serveur soit prêt
+-- (IsThrottledMessageSystemReady, comme TSM / Mastercraft), et sans réponse on renvoie (4 essais).
+-- Demande « tout l'HV » : la même qu'Auctionator (sans tri ni filtre).
+function SQ.Query()
+    return { searchString = "", sorts = {}, filters = {}, itemClassFilters = {} }
+end
+
+function SQ.Send(token, try, waited)
+    if not (scanRunning and token == scanToken and SQ.first) then return end
+    SQ.try = try
+    local ready = not C_AuctionHouse.IsThrottledMessageSystemReady or C_AuctionHouse.IsThrottledMessageSystemReady()
+    if not ready and waited < 40 then -- 10 s au plus
+        C_Timer.After(0.25, function() SQ.Send(token, try, waited + 1) end)
+        return
+    end
+    C_AuctionHouse.SendBrowseQuery(SQ.Query())
+    C_Timer.After(8, function()
+        if not (scanRunning and token == scanToken and SQ.first) then return end
+        if try < SQ.TRIES then
+            SetStatus(string.format("Pas de réponse du serveur, nouvel essai (%d / %d)…", try + 1, SQ.TRIES),
+                string.format("Scan : essai %d", try + 1))
+            SQ.Send(token, try + 1, 0)
+        else
+            scanRunning, SQ.first = false, false
+            -- Vu le 09/11 : après un /reload devant l'HV, la session rouverte par le jeu ne répond pas ; il faut
+            -- reparler au commissaire-priseur.
+            SetStatus("L'HV ne répond pas : ferme-le et reparle au commissaire-priseur, puis relance le scan.",
+                "HV bloqué")
+        end
+    end)
 end
 
 local function StartScan()
     if scanRunning then return end
+    SQ.paused, SQ.lost = false, 0
     -- Vérification / étude du marché en cours (ex. 12/30) : on l'arrête, pour que ses recherches ne
     -- se mêlent pas aux pages du scan ; elle repart d'elle-même à la fin du nouveau scan.
     if ns._StopDetails then ns._StopDetails() end
     scanRunning = true
     scanResults, scanQty, scanKeys = {}, {}, {}
-    -- Nouvelle liste vide, remplie au fil des pages.
+    -- Nouvelle liste vide, remplie au fil des pages. L'ancienne reste affichée (et sauvegardée) jusqu'à la
+    -- 1re page reçue : avant, un scan sans réponse du serveur laissait une liste VIDE, gardée au /reload (09/11).
     liveList, liveSeen = {}, {}
-    Saved().items = liveList
     palierSounded = false -- un « ting » au 1er palier confirmé de ce scan
     scanToken = scanToken + 1
     local token = scanToken
     SetStatus("Scan demandé au serveur…", "Scan : envoi…")
-    C_AuctionHouse.SendBrowseQuery({ searchString = "", sorts = {}, filters = {}, itemClassFilters = {} })
-    C_Timer.After(10, function()
-        if scanRunning and token == scanToken then
-            scanRunning, globalMode = false, false
-            SetStatus("Le serveur n'a pas répondu. Réessaie dans quelques secondes.", "Pas de réponse")
-        end
-    end)
+    SQ.first = true
+    SQ.Send(token, 1, 0)
 end
 
 ---------------------------------------------------------------------------
@@ -574,7 +662,7 @@ local function ExpectPurchase(qty, expected, unitArg)
     pendingSeq = pendingSeq + 1
     local p = {
         key = pendingSeq, entry = e, id = e.id, name = e.name, vendor = e.vendor, qty = qty,
-        expected = expected, unitArg = unitArg, palier = e.kind == "palier", resale = e.resale,
+        expected = expected, unitArg = unitArg, palier = e.kind == "palier", resale = e.resale, maxUnit = e.maxUnit,
         before = GetMoney(), countBefore = ItemCount(e.id),
         overlap = next(pendings) ~= nil,
     }
@@ -626,15 +714,18 @@ function ns.AddInbound(itemID, qty)
 end
 
 -- Quantité possédée (sacs + achats en route), et la part encore au courrier.
+-- Renvoie : total possédé (sacs + courrier en route + banque), part au courrier, part en banque (ns.BankCount,
+-- dernière visite à la banque ; banque ouverte, le jeu ne compte pas la banque dans les sacs : pas de double compte).
 function ns.Owned(itemID)
     local bag = BagCount(itemID)
+    local bank = ns.BankCount and ns.BankCount(itemID) or 0
     local r = EryAddonDB and EryAddonDB.enRoute and EryAddonDB.enRoute[itemID]
-    if not r then return bag, 0 end
+    if not r then return bag + bank, 0, bank end
     if bag >= r.base + r.q or time() - r.t > 3 * 86400 then
         EryAddonDB.enRoute[itemID] = nil
-        return bag, 0
+        return bag + bank, 0, bank
     end
-    return r.base + r.q, r.base + r.q - bag
+    return r.base + r.q + bank, r.base + r.q - bag, bank
 end
 
 -- Boîte aux lettres ouverte : un objet en route qui n'y est plus a été pris (et peut-être déjà
@@ -747,10 +838,14 @@ ReportPurchase = function(p)
         if received > 0 and p.palier then
             -- Palier : à revendre à l'HV (pas au marchand) ; pas dans le bilan « revente au marchand ».
             local net = p.vendor * received
+            local resaleTxt = Money(p.resale or math.floor(p.vendor / (1 - PALIER_COMMISSION)))
             if net > paid then
                 Msg(string.format("|cff00ff00acheté|r %d x %s pour %s (%s l'unité). Mets-les en vente à %s : "
-                    .. "gain visé %s.", received, p.name, Money(paid), Money(paid / received),
-                    Money(p.resale or math.floor(p.vendor / (1 - PALIER_COMMISSION))), Money(net - paid)))
+                    .. "gain visé %s.", received, p.name, Money(paid), Money(paid / received), resaleTxt, Money(net - paid)))
+            elseif p.maxUnit and paid <= p.maxUnit * received then
+                -- Annonce du haut de la poche : seule elle ne rapporte pas, mais l'acheter te laisse le moins cher.
+                Msg(string.format("|cff00ff00acheté|r %d x %s pour %s (%s l'unité) : le haut de la poche, rentable avec "
+                    .. "le reste du lot. Mets-les en vente à %s.", received, p.name, Money(paid), Money(paid / received), resaleTxt))
             else
                 Msg(string.format("|cffff3333PERTE|r : %d x %s payés %s (%s l'unité), plus que la revente visée (%s). "
                     .. "Achats de cet objet arrêtés.", received, p.name, Money(paid), Money(paid / received), Money(net)))
@@ -1007,11 +1102,16 @@ end
 -- Vérification d'un palier (recherche faite) : poche et mur réels. Faux : la ligne disparaît.
 local function CheckPalier(e, event, arg)
     local levels = SearchLevels(event, arg, e.id)
-    local p = PalierFromLevels(levels, e.ref, e.perDay)
-    if not p then return false end
-    -- Les 10 niveaux de prix les moins chers, pour l'échelle « poche / mur » de l'écran Opportunités.
+    local p = PalierFromLevels(levels, e.ref, e.perDay, event ~= "COMMODITY_SEARCH_RESULTS_UPDATED")
+    -- Les 10 niveaux de prix les moins chers, pour l'échelle « poche / mur » de l'écran Opportunités (gardés même
+    -- sans palier : la ligne reste affichée tant que Jérémie la consulte).
+    table.sort(levels, function(a, b) return a.p < b.p end)
     e.levels = {}
     for i = 1, math.min(10, #levels) do e.levels[i] = { p = levels[i].p, q = levels[i].q } end
+    if not p then
+        e.maxUnit, e.resale, e.wall = nil, nil, nil -- plus de poche / mur / revente : l'échelle n'en montre pas
+        return false
+    end
     e.vendor, e.maxUnit, e.resale, e.wall, e.wallQty = p.net, p.maxUnit, p.resale, p.wall, p.wallQty
     e.capQty = (e.bought or 0) + p.qty
     if not palierSounded then
@@ -1054,299 +1154,12 @@ local function OnItemResults(itemKey)
 end
 
 ---------------------------------------------------------------------------
--- ÉTUDE DU MARCHÉ (demande de Jérémie : trier les objets « morts » des objets « actifs »).
--- Après chaque scan, une recherche par objet que tes métiers fabriquent (liste donnée par
--- EryAddon_Jobs.lua : ns.MarketItems) relève les annonces : quantité, prix, vendeur, temps restant.
---
--- Version 2 (fiabilité, après « 67 144 ventes par jour » pour le Sac rouge en lin) :
---   - les annonces sont regroupées par VENDEUR + PRIX (le jeu regroupe lui-même les exemplaires
---     identiques des objets non empilables, et leur numéro d'enchère change : on ne s'y fie plus) ;
---   - le jeu n'envoie souvent que le DÉBUT de la liste (les moins chères) : on ne compare que la
---     partie vue dans les deux relevés (prix sous le plus haut prix vu des deux côtés) ; c'est là
---     que partent les ventes, les acheteurs prenant les moins chères ;
---   - par vendeur : ce qui disparaît et réapparaît à un autre prix = REMISE EN VENTE ;
---   - le reste qui disparaît : VENDU si le temps restant dépassait l'écart entre les relevés,
---     EXPIRÉ s'il était plus court, INCERTAIN sinon (objets non empilables : le jeu ne donne qu'une
---     tranche de temps : moins de 30 min, 30 min à 2 h, 2 h à 12 h, 12 h à 48 h) ;
---   - mémoire : les 7 derniers jours, chaque intervalle daté.
--- EryAddonDB.hvMarche[objet] = { v = 2, t, cap (prix max vu, nil = liste complète),
---   a = { ["vendeur|prix"] = { q, lmin, lmax (temps restant, s), first (vu depuis) } },
---   iv = { { t, h, vendu, incertain, expire, remis, nouveau }, … } }
----------------------------------------------------------------------------
-local MARKET_DAYS = 7
--- Temps restant d'une tranche (objets non empilables) : minimum et maximum, en secondes.
-local BAND = { [0] = { 0, 1800 }, [1] = { 1800, 7200 }, [2] = { 7200, 43200 }, [3] = { 43200, 172800 } }
-
-local function Market()
-    EryAddonDB.hvMarche = EryAddonDB.hvMarche or {}
-    return EryAddonDB.hvMarche
-end
-
--- Annonces d'un objet, regroupées par vendeur + prix ; renvoie aussi le prix le plus haut vu et si
--- la liste est complète.
-local function ReadAuctions(event, arg, itemID)
-    local groups, maxPrice, full = {}, 0, true
-    local function Add(r, price, lmin, lmax)
-        if not (r and price and price > 0) then return end
-        local owner = (r.owners and r.owners[1]) or "?"
-        if r.containsOwnerItem then owner = "player" end
-        local key = owner .. "|" .. price
-        local g = groups[key]
-        if not g then
-            g = { o = owner, p = price, q = 0, lmin = lmin, lmax = lmax }
-            groups[key] = g
-        end
-        g.q = g.q + (r.quantity or 1)
-        g.lmin, g.lmax = math.min(g.lmin, lmin), math.max(g.lmax, lmax)
-        if price > maxPrice then maxPrice = price end
-    end
-    if event == "COMMODITY_SEARCH_RESULTS_UPDATED" then
-        for i = 1, C_AuctionHouse.GetNumCommoditySearchResults(itemID) do
-            local r = C_AuctionHouse.GetCommoditySearchResultInfo(itemID, i)
-            local left = r and r.timeLeftSeconds or 0
-            Add(r, r and r.unitPrice, left, left)
-        end
-        if C_AuctionHouse.HasFullCommoditySearchResults then
-            full = C_AuctionHouse.HasFullCommoditySearchResults(itemID) and true or false
-        end
-    else
-        for i = 1, C_AuctionHouse.GetNumItemSearchResults(arg) do
-            local r = C_AuctionHouse.GetItemSearchResultInfo(arg, i)
-            local band = BAND[r and r.timeLeft or 0] or BAND[0]
-            Add(r, r and (r.buyoutAmount or r.bidAmount), band[1], band[2])
-        end
-        if C_AuctionHouse.HasFullItemSearchResults then
-            full = C_AuctionHouse.HasFullItemSearchResults(arg) and true or false
-        end
-    end
-    -- Sauvegarde raisonnable : on garde les 25 groupes les moins chers ; au-delà, la liste est traitée
-    -- comme incomplète (on ne compare que sous le prix du 25e).
-    local n = 0
-    for _ in pairs(groups) do n = n + 1 end
-    if n > 25 then
-        local prices = {}
-        for _, g in pairs(groups) do prices[#prices + 1] = g.p end
-        table.sort(prices)
-        local limit = prices[25]
-        for key, g in pairs(groups) do if g.p > limit then groups[key] = nil end end
-        full, maxPrice = false, limit
-    end
-    return groups, (not full) and maxPrice or nil
-end
-
--- Compare deux relevés (old, new : groupes vendeur|prix) sur la partie vue des deux côtés.
-local function CompareAuctions(old, oldCap, new, newCap, elapsed)
-    local iv = { t = time(), h = elapsed / 3600, vendu = 0, incertain = 0, expire = 0, remis = 0, nouveau = 0 }
-    local cap = math.min(oldCap or math.huge, newCap or math.huge)
-    -- Par vendeur : ce qui a disparu (avec son temps restant) et ce qui est apparu.
-    local gone, came = {}, {}
-    for key, a in pairs(old) do
-        if a.o ~= "player" and a.p < cap then
-            local n = new[key]
-            local d = a.q - (n and n.q or 0)
-            if d > 0 then
-                gone[a.o] = gone[a.o] or {}
-                table.insert(gone[a.o], { q = d, lmin = a.lmin, lmax = a.lmax })
-            end
-        end
-    end
-    for key, b in pairs(new) do
-        if b.o ~= "player" and b.p < cap then
-            local a = old[key]
-            local d = b.q - (a and a.q or 0)
-            if d > 0 then came[b.o] = (came[b.o] or 0) + d end
-        end
-    end
-    for owner, list in pairs(gone) do
-        -- Remise en vente : le même vendeur remet des exemplaires (à un autre prix).
-        -- Vendeur inconnu (« ? » : le jeu cache les vendeurs des objets empilables) : ce qui disparaît et
-        -- ce qui apparaît dans le même intervalle est compté comme remis en vente (guerres de prix),
-        -- pas comme vendu (bug : « Acide sulfurique : 2 087 ventes par jour »).
-        local relist = came[owner] or 0
-        for _, g in ipairs(list) do
-            local r = math.min(relist, g.q)
-            relist = relist - r
-            iv.remis = iv.remis + r
-            came[owner] = (came[owner] or 0) - r
-            local q = g.q - r
-            if q > 0 then
-                if g.lmin > elapsed + 300 then
-                    iv.vendu = iv.vendu + q
-                elseif g.lmax < elapsed then
-                    iv.expire = iv.expire + q
-                else
-                    iv.incertain = iv.incertain + q
-                end
-            end
-        end
-    end
-    for _, q in pairs(came) do if q > 0 then iv.nouveau = iv.nouveau + q end end
-    return iv
-end
-
-local function RecordMarket(itemID, event, arg)
-    local now = time()
-    local new, cap = ReadAuctions(event, arg, itemID)
-    local m = Market()[itemID]
-    if m and m.v ~= 3 then m = nil end -- format v3 (remises « ? » corrigées, 07/11) : les anciens relevés, faux, sont oubliés
-    for key, g in pairs(new) do
-        local before = m and m.a and m.a[key]
-        g.first = (before and before.first) or now
-    end
-    if m and m.t then
-        local elapsed = now - m.t
-        if elapsed < 15 * 60 then return end -- trop tôt : l'ancien relevé reste la référence
-        m.iv = m.iv or {}
-        -- Écart > 24 h (durée maximale d'une annonce) : toutes les annonces ont forcément disparu, on ne
-        -- peut rien conclure (avant : 72 h → tout passait en « expiré », zéro vente : faux « mort »).
-        if elapsed <= 24 * 3600 then
-            table.insert(m.iv, CompareAuctions(m.a, m.cap, new, cap, elapsed))
-        end
-        -- Mémoire : les 7 derniers jours servent au calcul ; les plus anciens sont GARDÉS (30 bilans au plus)
-        -- pour afficher la dernière info fiable quand il n'y a rien de récent (demande de Jérémie).
-        while #m.iv > 20 do table.remove(m.iv, 1) end
-    end
-    m = m or { v = 3, iv = {} }
-    m.t, m.a, m.cap = now, new, cap
-    Market()[itemID] = m
-    -- Pas plus de 1 500 objets suivis : les plus anciens relevés sont oubliés.
-    local all, count = Market(), 0
-    for _ in pairs(all) do count = count + 1 end
-    if count > 1500 then
-        local ages = {}
-        for id, x in pairs(all) do ages[#ages + 1] = { id = id, t = x.t or 0 } end
-        table.sort(ages, function(a, b) return a.t < b.t end)
-        for i = 1, count - 1500 do all[ages[i].id] = nil end
-    end
-end
-ns._RecordMarket = RecordMarket -- pour le test hors jeu (outils/test_guide.py)
-
--- État du marché d'un objet, ou nil si on ne l'a jamais relevé (format v2).
--- { etat = "mort" | "calme" | "actif" | "inconnu", parJour (estimation : sûres + moitié des
---   incertaines), min / max par jour (fourchette), vendeurs, enVente, dort (heures de la plus
---   vieille annonce encore là), heures observées, releves }
-function ns.MarketState(itemID)
-    local m = EryAddonDB and EryAddonDB.hvMarche and EryAddonDB.hvMarche[itemID]
-    if not m or m.v ~= 3 or not m.a then return nil end
-    local sellers, seen, listed, oldest = 0, {}, 0, 0
-    for _, g in pairs(m.a) do
-        if g.o ~= "player" then
-            listed = listed + g.q
-            if not seen[g.o] then seen[g.o] = true; sellers = sellers + 1 end
-            oldest = math.max(oldest, (m.t - (g.first or m.t)) / 3600)
-        end
-    end
-    local hours, sold, unsure, count = 0, 0, 0, 0
-    local now = time()
-    for _, iv in ipairs(m.iv or {}) do
-        if now - (iv.t or now) <= MARKET_DAYS * 86400 then
-            hours, sold, unsure = hours + iv.h, sold + iv.vendu, unsure + (iv.incertain or 0)
-            count = count + 1
-        end
-    end
-    -- Moins de 4 h observées ces 7 derniers jours (retour après une absence) : on garde aussi les bilans
-    -- plus anciens, pour ne pas jeter une info solide au profit d'une demi-heure ; « relevé du … » si
-    -- rien de récent du tout. Les nouveaux bilans prennent le relais d'eux-mêmes.
-    local ancien
-    if hours < 4 and m.iv and m.iv[1] then
-        if count == 0 then ancien = m.iv[#m.iv].t end
-        hours, sold, unsure, count = 0, 0, 0, 0
-        for _, iv in ipairs(m.iv) do
-            hours, sold, unsure = hours + iv.h, sold + iv.vendu, unsure + (iv.incertain or 0)
-            count = count + 1
-        end
-    end
-    local st = { vendeurs = sellers, enVente = listed, dort = oldest, heures = hours,
-        releves = count + 1, ancien = ancien }
-    if hours <= 0 then st.etat = "inconnu" return st end
-    st.min = sold / hours * 24
-    st.max = (sold + unsure) / hours * 24
-    st.parJour = (sold + unsure / 2) / hours * 24
-    if sold + unsure == 0 then
-        -- « Mort » seulement avec assez de preuves : 2 jours observés et 3 relevés.
-        -- « Mort » : aucune vente sur 8 h observées et au moins 3 relevés (choix de Jérémie ; avant 48 h).
-        st.etat = (hours >= 8 and st.releves >= 3) and "mort" or "calme"
-    elseif st.parJour < 1 then
-        st.etat = "calme"
-    else
-        st.etat = "actif"
-    end
-    return st
-end
-
--- Objets à étudier après ce scan : ce que tes métiers fabriquent et qui est en vente.
--- « minAge » (secondes) : seulement les objets relevés il y a plus longtemps que ça (reprise à
--- l'ouverture de l'HV) ; nil = tous. Les clés de recherche viennent du dernier scan, ou de la
--- sauvegarde (EryAddonDB.hvCles) : l'étude peut donc tourner sans refaire de scan.
--- Demande de Jérémie : « scanner un maximum, en 10 min environ », dans cet ordre :
---   1. tes objets (ventes, métiers principaux : ns.MarketItems) ;
---   2. le reste de l'HV DÉJÀ ÉTUDIÉ, le relevé le plus ancien d'abord (comparer deux relevés du MÊME objet
---      est ce qui donne les ventes : on relit d'abord ceux qu'on connaît) ;
---   3. le reste de l'HV jamais étudié (il entre dans la boucle s'il reste du temps) ;
---   4. Secourisme et Cuisine.
--- La limite de temps (STUDY_TIME) arrête l'étude ; le passage suivant reprend dans le même ordre.
-local function StudyEntries(minAge)
-    local list = {}
-    local saved = EryAddonDB.hvCles or {}
-    local market = EryAddonDB.hvMarche or {}
-    local now = time()
-    local seen = {}
-    local function Due(id)
-        local m = market[id]
-        return not minAge or not (m and m.v == 3 and m.t) or now - m.t >= minAge
-    end
-    local function AddList(idlist)
-        for _, id in ipairs(idlist) do
-            if not seen[id] then
-                seen[id] = true
-                local key = lastScanKeys[id] or saved[id]
-                if key and Due(id) then list[#list + 1] = { id = id, itemKey = key, study = true } end
-            end
-        end
-    end
-    AddList(ns.MarketItems and ns.MarketItems() or {})
-    local secondary = ns.MarketItems and ns.MarketItems(true) or {}
-    for _, id in ipairs(secondary) do seen[id] = seen[id] or "plus tard" end
-    local known, fresh = {}, {}
-    for id, key in pairs(saved) do
-        if not seen[id] and Due(id) then
-            local m = market[id]
-            if m and m.v == 3 and m.t then
-                known[#known + 1] = { id = id, itemKey = lastScanKeys[id] or key, study = true, age = m.t }
-            else
-                fresh[#fresh + 1] = { id = id, itemKey = lastScanKeys[id] or key, study = true }
-            end
-        end
-    end
-    table.sort(known, function(a, b) return a.age < b.age end)
-    for _, e in ipairs(known) do list[#list + 1] = e end
-    for _, e in ipairs(fresh) do list[#list + 1] = e end
-    for _, id in ipairs(secondary) do if seen[id] == "plus tard" then seen[id] = nil end end
-    AddList(secondary)
-    return list
-end
-
--- Après un scan : clés de recherche des objets étudiés gardées dans la sauvegarde.
-SaveStudyKeys = function()
-    EryAddonDB.hvCles = EryAddonDB.hvCles or {}
-    for id, k in pairs(lastScanKeys) do
-        if k then
-            EryAddonDB.hvCles[id] = { itemID = k.itemID, itemLevel = k.itemLevel, itemSuffix = k.itemSuffix,
-                battlePetSpeciesID = k.battlePetSpeciesID }
-        end
-    end
-end
-
----------------------------------------------------------------------------
 -- Après le scan : vérification des quantités de chaque objet de la liste
 -- (une recherche par objet, automatique, AUCUN achat), pour connaître le gain
 -- TOTAL du lot et trier la liste par ce gain (demande de Jérémie).
 ---------------------------------------------------------------------------
 local detailQueue, detailCurrent, detailToken, detailTotal = {}, nil, 0, 0
 local detailRunning = false
-local detailStudied = false -- l'étude du marché a tourné : Jobs à rafraîchir à la fin
-local STUDY_TIME = 600 -- secondes d'étude du marché par passage à l'HV (demande de Jérémie : ~10 min)
-local studyStart -- heure de début de l'étude en cours
 
 local function BuyerBusy()
     local s = Buyer.state
@@ -1356,93 +1169,81 @@ end
 local DetailNext
 DetailNext = function()
     if not detailRunning then return end
-    -- Pendant un achat, on laisse la place : on reprend une seconde plus tard.
-    if BuyerBusy() then C_Timer.After(1, DetailNext); return end
+    -- Pendant un achat, on laisse la place : on reprend une seconde plus tard. Limite du jeu atteinte : on attend.
+    if BuyerBusy() or not SQ.CanAuto() then C_Timer.After(1, DetailNext); return end
+    if not SQ.Ready() then C_Timer.After(0.2, DetailNext); return end -- le jeu n'est pas prêt : on attend
     detailCurrent = table.remove(detailQueue, 1)
     if not detailCurrent then
-        detailRunning, studyStart = false, nil
+        detailRunning = false
         local items = Saved().items
         table.sort(items, function(a, b) return (a.profit or a.unitGain) > (b.profit or b.unitGain) end)
-        if globalMode then
-            globalMode = false
-            Msg(string.format("scan global terminé : %d objets étudiés.", detailTotal))
-        end
         SetStatus("")
-        if detailStudied then
-            detailStudied = false
-            if ns.JobsRefresh then ns.JobsRefresh() end -- état des marchés : Jobs et guide recalculés
-        end
         return
     end
     local e = detailCurrent
-    if e.study then
-        studyStart = studyStart or GetTime()
-        if not globalMode and GetTime() - studyStart > STUDY_TIME then
-            -- 10 min atteintes : on s'arrête là ; le prochain passage reprend avec les plus anciens.
-            detailQueue, detailCurrent, detailRunning, studyStart = {}, nil, false, nil
-            SetStatus("Étude du marché : pause (10 min). Elle reprendra à ta prochaine visite.", "EDM : pause")
-            if detailStudied then detailStudied = false; if ns.JobsRefresh then ns.JobsRefresh() end end
-            return
-        end
-    end
     e.commodity = IsCommodity(e.id)
-    if e.study and globalMode then
-        local done = detailTotal - #detailQueue
-        SetStatus(string.format("Scan global : étude du marché %d / %d (sans limite de temps)", done, detailTotal),
-            string.format("Global %d/%d", done, detailTotal))
-    elseif e.study then
-        local left = studyStart and math.max(0, STUDY_TIME - (GetTime() - studyStart)) or STUDY_TIME
-        SetStatus(string.format("Étude du marché : %d / %d  (encore %d min max)", detailTotal - #detailQueue,
-            detailTotal, math.ceil(left / 60)), string.format("EDM %d/%d", detailTotal - #detailQueue, detailTotal))
-    else
-        SetStatus(string.format("Vérification des quantités : %d / %d", detailTotal - #detailQueue, detailTotal),
-            string.format("Vérif. %d/%d", detailTotal - #detailQueue, detailTotal))
-    end
+    SetStatus(string.format("Vérification des quantités : %d / %d", detailTotal - #detailQueue, detailTotal),
+        string.format("Vérif. %d/%d", detailTotal - #detailQueue, detailTotal))
     detailToken = detailToken + 1
     local token = detailToken
     C_AuctionHouse.SendSearchQuery(SearchKey(e), PRICE_SORT, not e.commodity)
-    -- Sans réponse, on passe au suivant.
+    local seq = SQ.seq
+    -- Sans réponse en 4 s : réessayé UNE fois en fin de liste ; muet (sauté 7 jours) au 2e silence.
     C_Timer.After(4, function()
         if detailCurrent == e and token == detailToken then
-            -- Aucune réponse : rien d'achetable trouvé → mis de côté à ce prix (prix fantôme).
-            e.done = true
-            if not e.study then MarkExhausted(e) end
+            -- Une autre recherche est partie entre-temps (clic sur une ligne, survol, écran Acheter / Vendre…) :
+            -- elle a pris la réponse. L'objet n'est pas muet : on le refait un peu plus tard (vécu 09/11 : clic
+            -- pendant la vérification → faux « HV bloqué » à chaque fois).
+            if SQ.seq ~= seq then
+                detailCurrent = nil
+                table.insert(detailQueue, 1, e)
+                C_Timer.After(1, DetailNext)
+                return
+            end
+            -- RÈGLE (09/11, Jérémie : « j'en ai marre de voir ce message ») : un silence n'arrête rien. Plusieurs
+            -- de suite : le jeu est encombré → pause de 5 s avant la suite ; 6 de suite : l'HV ne répond plus.
             detailCurrent = nil
-            DetailNext()
+            SQ.silent = (SQ.silent or 0) + 1
+            if SQ.silent >= 6 then
+                table.insert(detailQueue, 1, e)
+                detailQueue, detailRunning = {}, false
+                SetStatus("L'HV ne répond plus : ferme-le et reparle au commissaire-priseur, puis relance le scan.",
+                    "HV bloqué")
+                return
+            end
+            local wait = SQ.silent >= 2 and 5 or 1
+            -- 1er silence de CET objet : réessayé UNE fois en fin de liste (demande de Jérémie).
+            if not e.retried then
+                e.retried = true
+                detailQueue[#detailQueue + 1] = e
+                detailTotal = detailTotal + 1
+                C_Timer.After(wait, DetailNext)
+                return
+            end
+            e.done = true
+            EryAddonDB.hvMuets = EryAddonDB.hvMuets or {}
+            local m = EryAddonDB.hvMuets[e.id] or { n = 0 }
+            m.n, m.t = m.n + 1, time()
+            EryAddonDB.hvMuets[e.id] = m
+            UpdateWindow()
+            C_Timer.After(wait, DetailNext)
         end
     end)
 end
 
 StartDetails = function(list)
-    detailQueue, detailCurrent = {}, nil
-    for _, e in ipairs(list) do detailQueue[#detailQueue + 1] = e end
-    -- Étude du marché : seulement les objets pas relevés depuis 30 min (inutile de refaire les autres) ;
-    -- scan global : TOUS les objets.
-    for _, e in ipairs(StudyEntries(not globalMode and 1800 or nil)) do detailQueue[#detailQueue + 1] = e end
-    detailStudied = false
+    detailQueue, detailCurrent, SQ.silent = {}, nil, 0
+    local muets, now = EryAddonDB.hvMuets or {}, time()
+    for _, e in ipairs(list) do
+        local mu = muets[e.id]
+        if mu and mu.t and now - mu.t < 7 * 86400 then
+            e.done = true -- objet muet : sa recherche bloquerait l'HV
+        else
+            detailQueue[#detailQueue + 1] = e
+        end
+    end
     detailTotal = #detailQueue
     detailRunning = detailTotal > 0
-    DetailNext()
-end
-
--- Étude seule, SANS scan (demande de Jérémie : « capitaliser sans être sur l'HV ») : à chaque
--- ouverture de l'HV, on reprend les objets relevés il y a plus d'une heure. Fermer l'HV l'arrête
--- (le jeu n'accepte les recherches que devant le commissaire-priseur) ; ce qui est relevé est gardé,
--- et la suite reprend à la prochaine ouverture.
-local STUDY_MIN_AGE = 1800 -- 30 min : choix de Jérémie (l'HV de Forever bouge vite)
-local function StartStudyOnly()
-    if detailRunning or scanRunning then return end
-    -- La sonde du scan complet tourne : l'étude attend qu'elle finisse (pas de recherches mêlées).
-    if ns._sondeEnCours then C_Timer.After(5, StartStudyOnly) return end
-    -- Nouvelle fenêtre ouverte (écran Vendre) : ses recherches passent d'abord ; pas d'étude en même temps.
-    if ns.Fenetre and ns.Fenetre.IsOpen and ns.Fenetre.IsOpen() then return end
-    if not (AuctionHouseFrame and AuctionHouseFrame:IsShown()) then return end
-    local list = StudyEntries(STUDY_MIN_AGE)
-    if #list == 0 then return end
-    detailQueue, detailCurrent = list, nil
-    detailStudied = false
-    detailTotal = #list
-    detailRunning = true
     DetailNext()
 end
 
@@ -1450,31 +1251,37 @@ local function StopDetails()
     detailQueue, detailCurrent, detailRunning = {}, nil, false
 end
 
--- Scan global : le scan normal, puis l'étude de tout l'HV sans limite (voir globalMode).
-local function StartGlobalScan()
-    if scanRunning or globalMode then return end
-    globalMode = true
-    Msg("scan global lancé : tout l'HV, ça peut prendre une heure. Reste devant le commissaire-priseur.")
-    StartScan()
-    if not scanRunning then globalMode = false end
-end
 ns._StopDetails = StopDetails
 
+-- DÉBLOCAGE (09/11) : quand l'HV ne répond plus, une recherche faite dans l'interface du jeu le débloque
+-- (constaté par Jérémie). Ton clic sur « HV bloqué » lance donc la recherche de Blizzard elle-même (son
+-- bouton « Recherche »), puis la vérification reprend où elle en était, sans l'objet muet.
+-- CLIC = PRIORITÉ (09/11, Jérémie : « pendant la vérification, arrêter et m'afficher le truc sur lequel j'ai
+-- cliqué ») : l'objet cliqué passe EN TÊTE de la vérification, tout de suite ; l'objet en cours est remis juste
+-- derrière (sa réponse serait volée) ; une fois l'objet cliqué vérifié (échelle des paliers affichée), la
+-- vérification reprend là où elle en était. Sans vérification en cours (scan fini), une vérification d'un seul objet.
+function SQ.Priority(e)
+    if not e or e.done or detailCurrent == e then return end
+    if e.checkedT and time() - e.checkedT < 60 then return end -- vérifié il y a moins d'une minute : déjà affiché
+    for i, x in ipairs(detailQueue) do if x == e then table.remove(detailQueue, i) break end end
+    if detailCurrent then table.insert(detailQueue, 1, detailCurrent) end
+    detailCurrent, detailToken = nil, detailToken + 1 -- l'attente de l'objet en cours est annulée
+    table.insert(detailQueue, 1, e)
+    e.priority = true
+    if not detailRunning then detailRunning, detailTotal = true, #detailQueue end
+    UpdateWindow()
+    DetailNext()
+end
+
+
 local function OnDetailResults(event, arg)
+    SQ.silent = 0
     local e = detailCurrent
     if not e then return end
-    if e.study then
-        local id = (event == "COMMODITY_SEARCH_RESULTS_UPDATED") and arg or (type(arg) == "table" and arg.itemID)
-        if id ~= e.id then return end
-        pcall(RecordMarket, e.id, event, arg)
-        detailStudied = true
-        detailCurrent = nil
-        C_Timer.After(0.3, DetailNext)
-        return
-    end
     local isCommodity = event == "COMMODITY_SEARCH_RESULTS_UPDATED"
     if isCommodity and arg ~= e.id then return end
     if not isCommodity and (type(arg) ~= "table" or arg.itemID ~= e.id) then return end
+    e.checkedT = time()
     -- Palier : poche et mur relus dans les annonces réelles ; pas de palier → ligne retirée.
     if e.kind == "palier" and not CheckPalier(e, event, arg) then
         e.done = true
@@ -1489,6 +1296,10 @@ local function OnDetailResults(event, arg)
         if e.done then MarkExhausted(e) end
         -- Meilleure enchère payable, gardée pour l'achat en un clic.
         e.queue, e.queueTime = ItemQueue(arg, Limit(e), CapLeft(e)), time() -- file d'enchères pour l'achat en un clic
+    end
+    if e.priority then
+        e.priority = nil
+        if e.done then Msg(e.name .. " : plus d'affaire sur cet objet (les annonces ont changé).") end
     end
     detailCurrent = nil
     UpdateWindow()
@@ -1512,6 +1323,7 @@ local function Prefetch(e)
     if IsCommodity(e.id) then return end
     if e.queue and #e.queue > 0 and e.queueTime and time() - e.queueTime < PREFETCH_FRESH then return end
     if BuyerBusy() or detailCurrent then return end
+    if scanRunning or not SQ.CanAuto() then return end -- un simple survol ne gêne ni le scan ni la limite du jeu
     if Buyer.entry == e and Buyer.state == "ready" then return end
     prefetch = e
     prefetchToken = prefetchToken + 1
@@ -1606,6 +1418,24 @@ end
 
 -- Le jeu a bloqué une action de l'add-on (achat sans vrai clic).
 local Course -- achat de composant en cours (onglet Jobs), voir ns.BuyReagent plus bas
+
+-- Reprise du scan mis en pause par ton action (voir SQ.PauseForUser) : 3 s après ta dernière recherche ou ton
+-- dernier achat, et quand plus rien n'est en cours.
+function SQ.TryResume()
+    if not (scanRunning and SQ.paused) then return end
+    local busy = Course ~= nil or GetTime() - (SQ.lastUser or 0) < 3
+    local st = Buyer.state
+    if st == "searching" or st == "starting" or st == "confirm" or st == "buying" then busy = true end
+    if busy then C_Timer.After(1, SQ.TryResume) return end
+    SQ.paused, SQ.lost = false, 0
+    scanToken = scanToken + 1
+    if SQ.first then
+        SQ.Send(scanToken, 1, 0)
+    else
+        SetStatus("Scan : reprise…", "Scan : reprise")
+        NextPage()
+    end
+end
 
 local function OnActionBlocked(addon, func)
     if addon ~= ADDON_NAME then return end
@@ -1984,9 +1814,10 @@ ns.AnoAPI = {
     Commission = PALIER_COMMISSION,
     -- Scans (boutons de la barre du haut de la nouvelle fenêtre) et leur état en version courte.
     StartScan = function() StartScan() end,
-    StartGlobalScan = function() StartGlobalScan() end,
     ShortStatus = function() return shortText end,
     IsScanning = function() return scanRunning end,
+    Verify = function(e) SQ.Priority(e) end,
+    Checking = function(e) return e ~= nil and (detailCurrent == e or e.priority == true) end,
 }
 
 -- embedded = true : onglet DANS la fenêtre de l'HV ; sinon fenêtre à part, collée à droite.
@@ -2535,23 +2366,12 @@ local function SideTabs(lib, list)
     panel:SetPoint("TOPLEFT", AuctionHouseFrame, "TOPRIGHT", 0, -28)
     H.Skin(panel)
     panel:EnableMouse(true) -- les clics ne traversent pas vers le monde
-    -- En haut : les deux scans (ils servent à tous les onglets) et leur état en version courte.
+    -- En haut : le scan (il sert à tous les onglets) et son état en version courte.
     local scan = H.Button(panel, "Scanner l'HV", 104, 26, "muted")
     scan:SetPoint("TOPLEFT", panel, "TOPLEFT", 6, -6)
     scan:SetScript("OnClick", StartScan)
-    local global = H.Button(panel, "Scan global", 104, 26, "muted")
-    global:SetPoint("TOPLEFT", scan, "BOTTOMLEFT", 0, -4)
-    global:SetScript("OnClick", StartGlobalScan)
-    global:SetScript("OnEnter", function(self)
-        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        GameTooltip:AddLine("Scan global")
-        GameTooltip:AddLine("Scan + étude du marché de TOUS les objets de l'HV, sans limite de temps (environ 1 h).", 1, 1, 1, true)
-        GameTooltip:AddLine("Reste devant le commissaire-priseur : fermer l'HV l'arrête (ce qui est relevé est gardé).", 1, 1, 1, true)
-        GameTooltip:Show()
-    end)
-    global:SetScript("OnLeave", function(self) GameTooltip:Hide(); self:SetStyle(self.style) end)
     sideStatus = H.Text(panel, 11, H.SOFT)
-    sideStatus:SetPoint("TOPLEFT", global, "BOTTOMLEFT", 2, -6)
+    sideStatus:SetPoint("TOPLEFT", scan, "BOTTOMLEFT", 2, -6)
     sideStatus:SetWidth(100)
     sideStatus:SetJustifyH("LEFT")
     sideStatus:SetWordWrap(true)
@@ -2568,7 +2388,7 @@ local function SideTabs(lib, list)
             if prev then
                 b:SetPoint("TOPLEFT", prev, "BOTTOMLEFT", 0, -4)
             else
-                b:SetPoint("TOPLEFT", global, "BOTTOMLEFT", 0, -44) -- sous l'état du scan (2 lignes)
+                b:SetPoint("TOPLEFT", scan, "BOTTOMLEFT", 0, -44) -- sous l'état du scan (2 lignes)
             end
             b:SetScript("OnClick", function() lib:SetSelected(id) end)
             buttons[id] = b
@@ -2577,10 +2397,10 @@ local function SideTabs(lib, list)
     end
     -- Taille CALCULÉE (pas d'accroche au dernier bouton : il dépend lui-même du panneau, et le jeu refuse
     -- cette boucle, erreur « Cannot anchor to a region dependent on it » vue le 08/11).
-    -- Marge 6 + scan 26 + 4 + global 26 + 44 (état) + onglets (26 + 4 entre eux) + marge 6.
+    -- Marge 6 + scan 26 + 44 (état) + onglets (26 + 4 entre eux) + marge 6.
     local n = 0
     for _ in pairs(buttons) do n = n + 1 end
-    panel:SetSize(6 + 104 + 6, 6 + 26 + 4 + 26 + 44 + n * 26 + math.max(0, n - 1) * 4 + 6)
+    panel:SetSize(6 + 104 + 6, 6 + 26 + 44 + n * 26 + math.max(0, n - 1) * 4 + 6)
     -- Onglet choisi (le nôtre ou celui d'Auctionator) : surbrillance à jour.
     hooksecurefunc(lib, "SetSelected", function(_, id) Mark(id) end)
     -- Onglet du jeu (Acheter, Vendre…) : aucun des nôtres n'est choisi.
@@ -2623,155 +2443,11 @@ local function CreateToggleButton()
 end
 
 ---------------------------------------------------------------------------
--- SONDE DU SCAN COMPLET (08/11, demande de Jérémie : « nos limitations de scan peuvent-elles aller
--- plus loin ? »). Le jeu a un scan complet, C_AuctionHouse.ReplicateItems : UNE demande renvoie TOUTES
--- les annonces de l'HV une par une (prix, quantité, vendeur, temps restant), une fois par 15 min.
--- Jamais essayé sur Forever (option désactivée dans l'Auctionator de Jérémie). La sonde le lance UNE
--- fois, à l'ouverture de l'HV, et note ce qui arrive dans EryAddonDB.sondeReplicate (rien n'est
--- utilisé ailleurs pour l'instant). Pour la relancer : monter SONDE_VERSION.
----------------------------------------------------------------------------
-local SONDE_VERSION = 1
-local SONDE_CHUNK = 1000 -- annonces lues par image (pas de gel si l'HV en a beaucoup)
-local SONDE_TIMEOUT = 90
-local sonde -- { t0, token } pendant l'essai
-local sondeToken = 0
-local sondeFrame = CreateFrame("Frame")
-
-local function SondeDB()
-    local d = EryAddonDB.sondeReplicate
-    if type(d) ~= "table" then d = {}; EryAddonDB.sondeReplicate = d end
-    return d
-end
-
-local function SondeFin(d, texte)
-    ns._sondeEnCours = false
-    sonde = nil
-    sondeFrame:UnregisterAllEvents()
-    SetStatus("", "")
-    Msg(texte)
-end
-
-local function SondeLire(n, token)
-    local d = SondeDB()
-    local stats = { annonces = n, quantite = 0, avecVendeur = 0, sansInfo = 0, sansPrix = 0, piles = 0,
-        objets = 0, vendeurs = 0, temps = { [0] = 0, [1] = 0, [2] = 0, [3] = 0 }, msLecture = 0, msMaxImage = 0 }
-    local objets, vendeurs, exemples = {}, {}, {}
-    local i = 0
-    local function Etape()
-        if token ~= sondeToken then return end
-        local t = debugprofilestop()
-        local fin = math.min(n, i + SONDE_CHUNK)
-        while i < fin do
-            local ok, name, _, count, _, _, _, _, _, _, buyout, _, _, _, owner, ownerFull, _, itemID, hasAll =
-                pcall(C_AuctionHouse.GetReplicateItemInfo, i)
-            if ok then
-                local okT, left = pcall(C_AuctionHouse.GetReplicateItemTimeLeft, i)
-                count = count or 0
-                stats.quantite = stats.quantite + count
-                if count > 1 then stats.piles = stats.piles + 1 end
-                if not hasAll then stats.sansInfo = stats.sansInfo + 1 end
-                if not buyout or buyout == 0 then stats.sansPrix = stats.sansPrix + 1 end
-                local who = (type(ownerFull) == "string" and ownerFull ~= "" and ownerFull)
-                    or (type(owner) == "string" and owner ~= "" and owner) or nil
-                if who then
-                    stats.avecVendeur = stats.avecVendeur + 1
-                    if not vendeurs[who] then vendeurs[who] = true; stats.vendeurs = stats.vendeurs + 1 end
-                end
-                if itemID and not objets[itemID] then objets[itemID] = true; stats.objets = stats.objets + 1 end
-                if okT and left and stats.temps[left] then stats.temps[left] = stats.temps[left] + 1 end
-                if #exemples < 20 and (i % 500 == 0 or #exemples < 5) then
-                    exemples[#exemples + 1] = table.concat({ tostring(name), tostring(itemID), tostring(count),
-                        tostring(buyout), who and "vendeur vu" or "vendeur caché", tostring(okT and left) }, "|")
-                end
-            end
-            i = i + 1
-        end
-        local ms = debugprofilestop() - t
-        stats.msLecture = stats.msLecture + ms
-        if ms > stats.msMaxImage then stats.msMaxImage = ms end
-        if i < n then
-            SetStatus(string.format("Sonde du scan complet : %d / %d annonces lues", i, n),
-                string.format("Sonde %d/%d", i, n))
-            C_Timer.After(0, Etape)
-            return
-        end
-        stats.msLecture = math.floor(stats.msLecture)
-        stats.msMaxImage = math.floor(stats.msMaxImage)
-        local prix = EryAddonDB.hvPrix and EryAddonDB.hvPrix.prix
-        if type(prix) == "table" then
-            local c = 0
-            for _ in pairs(prix) do c = c + 1 end
-            stats.objetsDernierScan = c
-        end
-        d.stats, d.exemples, d.etat = stats, exemples, "ok"
-        d.version, d.fait = SONDE_VERSION, true
-        SondeFin(d, string.format("sonde du scan complet : %d annonces de %d objets reçues en %d s ; vendeur visible sur %d %%.",
-            n, stats.objets, math.floor(d.reponse or 0), n > 0 and math.floor(stats.avecVendeur * 100 / n) or 0))
-    end
-    Etape()
-end
-
-sondeFrame:SetScript("OnEvent", function(_, event)
-    if not sonde then return end
-    local d = SondeDB()
-    if event == "AUCTION_HOUSE_CLOSED" then
-        sondeToken = sondeToken + 1
-        d.etat = "interrompu (HV fermé), réessai à la prochaine ouverture"
-        SondeFin(d, "sonde du scan complet interrompue (HV fermé) : elle reprendra à ta prochaine visite.")
-    elseif event == "REPLICATE_ITEM_LIST_UPDATE" then
-        sondeFrame:UnregisterEvent("REPLICATE_ITEM_LIST_UPDATE") -- une seule réponse lue
-        d.reponse = GetTime() - sonde.t0
-        local ok, n = pcall(C_AuctionHouse.GetNumReplicateItems)
-        if not ok or not n then
-            d.etat, d.version, d.fait = "réponse sans nombre d'annonces", SONDE_VERSION, true
-            SondeFin(d, "sonde du scan complet : réponse reçue, mais le jeu ne donne pas le nombre d'annonces.")
-            return
-        end
-        SondeLire(n, sonde.token)
-    end
-end)
-
-local function StartSonde()
-    local d = SondeDB()
-    if d.fait and d.version == SONDE_VERSION then return end
-    if sonde or scanRunning or detailRunning then return end
-    if not (AuctionHouseFrame and AuctionHouseFrame:IsShown()) then return end
-    d.date = date("%d/%m %H:%M")
-    if not (C_AuctionHouse and C_AuctionHouse.ReplicateItems and C_AuctionHouse.GetNumReplicateItems
-        and C_AuctionHouse.GetReplicateItemInfo) then
-        d.etat, d.version, d.fait = "fonction absente sur Forever", SONDE_VERSION, true
-        return
-    end
-    sondeToken = sondeToken + 1
-    sonde = { t0 = GetTime(), token = sondeToken }
-    ns._sondeEnCours = true
-    pcall(sondeFrame.RegisterEvent, sondeFrame, "REPLICATE_ITEM_LIST_UPDATE")
-    pcall(sondeFrame.RegisterEvent, sondeFrame, "AUCTION_HOUSE_CLOSED")
-    SetStatus("Sonde du scan complet : en attente du serveur…", "Sonde…")
-    local ok, err = pcall(C_AuctionHouse.ReplicateItems)
-    if not ok then
-        sondeToken = sondeToken + 1
-        d.etat, d.erreur, d.version, d.fait = "erreur à l'appel", tostring(err), SONDE_VERSION, true
-        SondeFin(d, "sonde du scan complet : le jeu a refusé la demande.")
-        return
-    end
-    local token = sondeToken
-    C_Timer.After(SONDE_TIMEOUT, function()
-        if not sonde or sonde.token ~= token or d.reponse then return end
-        sondeToken = sondeToken + 1
-        d.etat, d.version, d.fait = "pas de réponse en " .. SONDE_TIMEOUT .. " s", SONDE_VERSION, true
-        SondeFin(d, "sonde du scan complet : aucune réponse du serveur en " .. SONDE_TIMEOUT .. " s.")
-    end)
-end
-
----------------------------------------------------------------------------
 -- Événements
 ---------------------------------------------------------------------------
 local frame = CreateFrame("Frame")
 frame:SetScript("OnEvent", function(_, event, ...)
     if event == "AUCTION_HOUSE_SHOW" then
-        C_Timer.After(1, StartSonde) -- sonde du scan complet (une seule fois)
-        C_Timer.After(3, StartStudyOnly) -- reprise de l'étude du marché, sans scan
         -- Petit délai : la fenêtre de l'HV de Blizzard est créée au même moment.
         C_Timer.After(0, function()
             if not AuctionHouseFrame then return end
@@ -2788,10 +2464,6 @@ frame:SetScript("OnEvent", function(_, event, ...)
         -- proprement ; ce qui est déjà relevé est gardé, la suite reprend à la prochaine ouverture.
         ResetBuyer()
         StopDetails()
-        if globalMode then
-            globalMode = false
-            Msg("scan global interrompu (HV fermé). Ce qui est relevé est gardé ; relance-le à ta prochaine visite.")
-        end
         if scanRunning then
             scanRunning = false
             scanToken = scanToken + 1 -- les relances programmées du scan s'annulent
@@ -2812,10 +2484,26 @@ frame:SetScript("OnEvent", function(_, event, ...)
         end
     elseif event == "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED" or event == "AUCTION_HOUSE_BROWSE_RESULTS_ADDED" then
         OnBrowseEvent(event, ...)
+    elseif event == "AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED" and detailCurrent then
+        local e = detailCurrent
+        detailCurrent, detailToken = nil, detailToken + 1 -- son attente de 4 s est annulée
+        table.insert(detailQueue, 1, e)
+        C_Timer.After(0.5, DetailNext)
+    elseif event == "AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED" or event == "AUCTION_HOUSE_BROWSE_FAILURE" then
+        -- Le serveur a jeté une demande : si c'est la 1re du scan, on la renvoie dès qu'il est prêt.
+        if scanRunning and SQ.first and SQ.try < SQ.TRIES then
+            scanToken = scanToken + 1
+            local token, try = scanToken, SQ.try + 1
+            SetStatus(string.format("Demande refusée par le serveur, nouvel essai (%d / %d)…", try, SQ.TRIES),
+                string.format("Scan : essai %d", try))
+            C_Timer.After(0.5, function() SQ.Send(token, try, 0) end)
+        end
     elseif event == "COMMODITY_SEARCH_RESULTS_UPDATED" then
+        SQ.lastResp = GetTime()
         OnCommodityResults(...)
         OnDetailResults(event, ...)
     elseif event == "ITEM_SEARCH_RESULTS_UPDATED" then
+        SQ.lastResp = GetTime()
         OnPrefetchResults(...)
         OnUniqueResults(...)
         OnItemResults(...)
@@ -2850,6 +2538,8 @@ local EVENTS = {
     "AUCTION_HOUSE_CLOSED",
     "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED",
     "AUCTION_HOUSE_BROWSE_RESULTS_ADDED",
+    "AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED",
+    "AUCTION_HOUSE_BROWSE_FAILURE",
     "COMMODITY_SEARCH_RESULTS_UPDATED",
     "ITEM_SEARCH_RESULTS_UPDATED",
     "COMMODITY_PRICE_UPDATED",
@@ -3033,7 +2723,7 @@ local function HookTooltip()
         if not itemID then return end
         local kind, vendorTotal, hvNet = Verdict(link, itemID, count)
         if not kind then return end
-        tooltip:AddLine(string.format("EryAddon : %s (marchand %s, HV net %s)",
+        tooltip:AddLine(string.format("FDC : %s (marchand %s, HV net %s)",
             kind == "pnj" and "mieux au marchand" or "mieux à l'HV",
             Money(vendorTotal), Money(math.max(0, hvNet))), 0.6, 1, 0.6)
         tooltip:Show()

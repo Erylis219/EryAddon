@@ -1,8 +1,8 @@
-# EryAddon
+# FDC - Federytion Du Commerce (dossier EryAddon)
 
 Add-on pour **World of Warcraft: Forever** (client en français) : nouvelle fenêtre d'hôtel des ventes (Acheter,
 Opportunités, Vendre, Mes enchères, Mes ventes, Métiers), icônes dans les sacs, carte des livres, etc.
-Tape `/eryaddon` en jeu pour activer ou désactiver chaque fonction.
+Tape `/fdc` en jeu pour activer ou désactiver chaque fonction.
 
 Conseillé : **TradeSkillMaster** (TSM) et son application, pour les prix du marché et les ventes par jour.
 Auctionator n'est plus nécessaire.

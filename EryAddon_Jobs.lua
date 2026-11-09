@@ -629,7 +629,7 @@ local function Compute(profID, skill, onlySpell)
 
             local name, sell = Objet(out)
             local hv = PrixHV(out)
-            -- Marché mort (TSM, sinon étude du marché) : pas de vente à l'HV.
+            -- Marché mort (TSM) : pas de vente à l'HV.
             if ns.MarketDead and ns.MarketDead(out) then hv = nil end
             local saleHV = hv and hv * qty * (1 - COMMISSION)
             local saleVendor = (sell or 0) * qty
@@ -812,79 +812,6 @@ local function TabLabel(pr)
     return pr.learned and (name .. " " .. (SkillOf(pr.name) or "?")) or name
 end
 
--- Objets à étudier en PRIORITÉ sur le marché (EryAddon_HV.lua, StudyEntries) : tes ventes, puis les
--- objets de tes métiers principaux en propagation autour de ton niveau (voir Propagation), puis leurs
--- composants (400 au plus). secondaryOnly : Secourisme / Cuisine, étudiés en dernier.
-function ns.MarketItems(secondaryOnly)
-    local LIMIT = 400
-    local ids, seen = {}, {}
-    local function Add(id)
-        if id and id > 0 and not seen[id] and #ids < LIMIT then seen[id] = true; ids[#ids + 1] = id end
-    end
-    -- 1. Ce que tu as mis en vente ou vendu (suivi de tes ventes).
-    local mv = EryAddonDB.mesVentes
-    if mv then
-        for _, src in ipairs({ mv.annonces or {}, mv.faits or {}, mv.ventesSansCourrier or {} }) do
-            for _, f in ipairs(src) do Add(f.id) end
-        end
-    end
-    -- 2. Tes métiers PRINCIPAUX d'abord (Jérémie : « le Secourisme et la Cuisine, on s'en moque ») :
-    --    objets fabriqués encore utiles (pas gris), puis leurs composants, puis le reste ;
-    --    les métiers secondaires viennent après.
-    local SECONDAIRE = { [129] = true, [185] = true, [356] = true }
-    local main, second, level = {}, {}, {}
-    for _, pr in ipairs(MyProfessions()) do
-        if pr.learned then
-            if SECONDAIRE[pr.id] then second[pr.id] = CapOf(pr.name) else main[pr.id] = CapOf(pr.name) end
-            level[pr.id] = LevelOf(pr)
-        end
-    end
-    -- Recettes des métiers PRINCIPAUX en « propagation » autour de ton niveau (demande de Jérémie, 08/11) :
-    -- chaque métier part de SON niveau et s'en éloigne d'un cran à la fois, vers le haut ET vers le bas
-    -- (distance = |niveau d'apprentissage − ton niveau|) ; tous tes métiers avancent en même temps, et à
-    -- distance égale le métier le plus monté passe d'abord, puis la recette en dessous de ton niveau.
-    local function Propagation(profs)
-        local ranks = {}
-        for id in pairs(profs) do ranks[#ranks + 1] = id end
-        table.sort(ranks, function(a, b)
-            if (level[a] or 1) ~= (level[b] or 1) then return (level[a] or 1) > (level[b] or 1) end
-            return a < b
-        end)
-        local rankOf = {}
-        for i, id in ipairs(ranks) do rankOf[id] = i end
-        local list = {}
-        for _, r in ipairs(ns.RECETTES or {}) do
-            if rankOf[r[1]] then
-                local diff = (r[4] or 1) - (level[r[1]] or 1)
-                list[#list + 1] = { r = r, d = math.abs(diff), up = diff > 0, rank = rankOf[r[1]] }
-            end
-        end
-        table.sort(list, function(a, b)
-            if a.d ~= b.d then return a.d < b.d end
-            if a.rank ~= b.rank then return a.rank < b.rank end
-            if a.up ~= b.up then return not a.up end
-            return a.r[2] < b.r[2]
-        end)
-        return list
-    end
-    if secondaryOnly then
-        -- Secourisme, Cuisine : en DERNIER, après tout le reste de l'HV (ordre voulu par Jérémie).
-        ids, seen = {}, {}
-        for _, r in ipairs(ns.RECETTES or {}) do
-            local cap = second[r[1]]
-            if cap and r[4] <= cap then Add(r[3]) end
-        end
-        return ids
-    end
-    local around = Propagation(main)
-    for _, x in ipairs(around) do Add(x.r[3]) end -- les objets fabriqués, du plus proche au plus loin
-    for _, x in ipairs(around) do                 -- puis leurs composants, dans le même ordre
-        local _, _, reag = RecipeData(x.r[2])
-        for id in (reag or ""):gmatch("(%d+):%d+") do Add(tonumber(id)) end
-    end
-    return ids
-end
-
 local function Rows()
     if not current then return {} end
     local skill = LevelOf(current)
@@ -1022,7 +949,11 @@ local function CountText(name, have, need)
 end
 local function MailNote(id)
     local mail = MailCount(id)
-    return mail > 0 and string.format("dont %d au courrier", mail) or nil
+    local bank = ns.Owned and select(3, ns.Owned(id)) or 0
+    local parts = {}
+    if mail > 0 then parts[#parts + 1] = string.format("%d au courrier", mail) end
+    if bank > 0 then parts[#parts + 1] = string.format("%d à la banque", bank) end
+    return parts[1] and ("dont " .. table.concat(parts, ", ")) or nil
 end
 
 -- Fiche de la recette choisie (maquette validée par Jérémie, 07/11) : une ligne par composant avec
@@ -1201,7 +1132,7 @@ local function Needs(e, want)
             if k then
                 if mail then notes[#notes + 1] = mail end
                 list[#list + 1] = { id = id, name = name, per = per, have = have, need = need, missing = missing,
-                    indent = level > 0 and level or nil,
+                    indent = level > 0 and level or nil, made = k,
                     price = string.format("|cff5cffb0à fabriquer : %d fabrication%s (moins cher)|r", k, k > 1 and "s" or "")
                         .. (notes[1] and ("  |cff5f8a99" .. table.concat(notes, " · ") .. "|r") or "") }
                 fabrications[#fabrications + 1] = { level = d.level[id] or 0, text = string.format("%d %s", missing, name) }
@@ -1219,6 +1150,7 @@ local function Needs(e, want)
                     indent = level > 0 and level or nil,
                     price = PriceLine(id, missing, buy, src)
                         .. (notes[1] and ("  |cff5f8a99" .. table.concat(notes, " · ") .. "|r") or ""),
+                    priceOnly = PriceLine(id, missing, buy, src), note = notes[1] and table.concat(notes, " · ") or nil,
                     buy = (missing > 0 and buy) and { kind = "buy", id = id, need = missing, have = 0, name = name,
                         unit = buy, src = src } or nil,
                     cost = (missing > 0 and buy) and buy * missing or 0,
@@ -1255,6 +1187,43 @@ local function Needs(e, want)
 end
 
 ns._Needs = Needs -- (test hors jeu)
+
+-- ARBRE DE LA RECETTE (09/11, maquette « 6b · Métiers, arbre de fabrication » validée par Jérémie) : la recette
+-- telle qu'elle est, SANS les sacs, chaque quantité à sa place (30 Barres de bronze sous la Télécommande, 10 sous
+-- le Bidule, chacune avec son cuivre et son étain). Un composant n'est déroulé que s'il se fabrique (mêmes règles
+-- que la liste de courses : tu connais la recette et elle revient moins cher que l'achat → selon TES métiers).
+-- Renvoie une liste de nœuds { key, id, name, qty, depth, craft (« Minage x15 »), kids = { … } } et, par objet
+-- acheté, ses quantités aux différents endroits (pour « 20 (15 + 5) »).
+local spellProf
+local function Tree(e, want)
+    if not spellProf then
+        spellProf = {}
+        for _, r in ipairs(ns.RECETTES or {}) do spellProf[r[2]] = r[1] end
+    end
+    local n = want or 1
+    local root = { key = "r", id = e.out, name = e.name, qty = n, depth = 0, kids = {},
+        craft = string.format("%s x%d", ns.METIERS[e.prof] or "?", n) }
+    local where = {}
+    if not (e.reag and e.reag ~= "?" and e.reag ~= "") then return root, where end
+    local d = Demand(n, e.reag)
+    local function Add(parent, id, qty, depth, path)
+        local node = { key = parent.key .. "/" .. id, id = id, name = Objet(id), qty = qty, depth = depth, kids = {} }
+        parent.kids[#parent.kids + 1] = node
+        local c = d.craft[id]
+        if c and c.made and c.made > 0 and depth < 6 and not path[id] then
+            local crafts = math.ceil(qty / c.made)
+            node.craft = string.format("%s x%d", ns.METIERS[spellProf[c.spell]] or "?", crafts)
+            path[id] = true
+            for _, sub in ipairs(c.sub) do Add(node, sub.id, crafts * sub.qty, depth + 1, path) end
+            path[id] = nil
+        else
+            where[id] = where[id] or {}
+            table.insert(where[id], qty)
+        end
+    end
+    for id, q in e.reag:gmatch("(%d+):(%d+)") do Add(root, tonumber(id), tonumber(q) * n, 1, {}) end
+    return root, where
+end
 ns._Compute = function(...) return Compute(...) end
 
 local selectedSpell -- recette affichée dans la fiche
@@ -1282,33 +1251,10 @@ SalesText = function(itemID, planned)
         return string.format("%sSe vend : env. %s par jour|r%s", color, perDayTSM < 0.2 and "0" or Num(perDayTSM),
             #extra > 0 and (" |cff5f8a99(" .. table.concat(extra, ", ") .. ")|r") or "")
     end
-    -- Étude du marché (annonces suivies une à une) quand on l'a.
-    local st = ns.MarketState and ns.MarketState(itemID)
-    if st and st.etat ~= "inconnu" then
-        local function Num(v)
-            return v >= 10 and string.format("%d", math.floor(v + 0.5)) or (string.format("%.1f", v):gsub("%.", ","))
-        end
-        -- Info ancienne (rien de récent) : on la montre quand même, avec sa date.
-        local old = st.ancien and (" |cff5f8a99(relevé du " .. date("%d/%m", st.ancien) .. ")|r") or ""
-        local days = st.heures >= 48 and string.format("%d jours", math.floor(st.heures / 24 + 0.5))
-            or string.format("%d h", math.floor(st.heures + 0.5))
-        if st.etat == "mort" then
-            return string.format("|cffff7373Marché mort : aucune vente en %s|r |cff5f8a99(%d en vente%s)|r", days,
-                st.enVente, st.dort >= 24 and string.format(", mêmes annonces depuis %d jours",
-                    math.floor(st.dort / 24 + 0.5)) or "") .. old
-        end
-        local color = st.etat == "actif" and "|cff5cffb0" or "|cffff9933"
-        if st.etat == "actif" and planned and planned > st.parJour * 3 then color = "|cffff9933" end
-        -- Fourchette quand une partie des disparitions est incertaine (vendue ou expirée ?).
-        local amount = (st.max - st.min >= 0.5) and (Num(st.min) .. " à " .. Num(st.max)) or Num(st.parJour)
-        return string.format("%sMarché %s : %s vente%s par jour|r |cff5f8a99(%d en vente, %d vendeur%s)|r",
-            color, st.etat, amount, st.max >= 2 and "s" or "", st.enVente, st.vendeurs,
-            st.vendeurs > 1 and "s" or "") .. old
-    end
     local listed = EryAddonDB.hvPrix and EryAddonDB.hvPrix.quantites and EryAddonDB.hvPrix.quantites[itemID] or 0
     local perDay = ns.HVSalesPerDay and ns.HVSalesPerDay(itemID)
     if not perDay then
-        return "|cff5f8a99Ventes à l'HV : pas encore assez de relevés|r"
+        return "|cff5f8a99Ventes à l'HV : inconnues|r"
     end
     local amount = perDay >= 10 and string.format("%d", math.floor(perDay + 0.5))
         or (string.format("%.1f", perDay):gsub("%.", ","))
@@ -1328,6 +1274,7 @@ ns.JobsAPI = {
     TabLabel = function(pr) return TabLabel(pr) end,
     Compute = function(profID, skill, onlySpell) return Compute(profID, skill, onlySpell) end,
     Needs = function(e, want) return Needs(e, want) end,
+    Tree = function(e, want) return Tree(e, want) end,
     CraftsPlanned = function(e) return CraftsPlanned(e) end,
     BuyLine = function(l, part) return BuyLine(l, part) end,
     SalesText = function(itemID, planned) return SalesText(itemID, planned) end,
@@ -1544,7 +1491,7 @@ local function ShowTooltip(row)
     else
         tip:AddLine(" ")
     end
-    tip:AddLine("|cff39d0ffEryAddon|r : " .. e.name, 1, 1, 1)
+    tip:AddLine("|cff39d0ffFDC|r : " .. e.name, 1, 1, 1)
     if e.multi > 1 then
         tip:AddLine(string.format("Donne %d points par fabrication tant qu'elle est orange", e.multi), 1, 0.5, 0.25)
     end
