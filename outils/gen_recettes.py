@@ -54,11 +54,20 @@ for fname in sorted(os.listdir(src_dir)):
         vend = ",".join("%s:%s:%s" % (a, b, (f[:1] if f else "N")) for a, b, f in
                         re.findall(r'npc = (\d+), area = (\d+)(?:, faction = "(\w+)")?', line))
         repm = re.search(r"reputation = \{ (\d+), (\d+)", line)
+        # Toutes les réputations possibles (« faction:rang,… ») : une seule suffit (ex. centaures Gelkis OU Magram ;
+        # Administration commerciale d'Azeroth OU Transports logistiques Durotar).
+        repall = ""
+        rb = re.search(r"reputation = \{([^}]*)\}", line)
+        if rb:
+            nums = re.findall(r"\d+", re.sub(r"ns\.L\.\w+", "", rb.group(1)))
+            repall = ",".join("%s:%s" % (nums[i], nums[i + 1]) for i in range(0, len(nums) - 1, 2))
+        mf = re.search(r"\bmerchantFavor = (\d+)", line)
         teach_id = int(teach.group(1)) if teach else 0
         rows.append((prof, spell, int(cr.group(1)), int(sk.group(1)) if sk else 0,
                      letters, int(cost.group(1)) if cost else 0, teach_id, y, g, n,
                      vend, int(repm.group(1)) if repm else 0, int(repm.group(2)) if repm else 0,
-                     achat.get(teach_id, 0) if "V" in letters else 0))
+                     achat.get(teach_id, 0) if "V" in letters else 0,
+                     repall, int(mf.group(1)) if mf else 0))
 
 with open(out, "w", encoding="utf-8", newline="\n") as f:
     f.write("-- EryAddon : liste des recettes de Forever (tous métiers), FICHIER GÉNÉRÉ par outils/gen_recettes.py.\n")
@@ -67,7 +76,9 @@ with open(out, "w", encoding="utf-8", newline="\n") as f:
     f.write("--            seuil jaune, seuil gris, points par fabrication,  (seuils officiels : table SkillLineAbility\n")
     f.write("--            de Forever 1.60.1, wago.tools ; vert = milieu entre jaune et gris ; 0 = inconnu)\n")
     f.write("--            marchands du patron \"PNJ:zone:faction(A/H/N),...\", réputation exigée : faction, rang (5 = Amical…),\n")
-    f.write("--            prix du patron chez le marchand (pc, table ItemSparse ; 0 = inconnu) }\n")
+    f.write("--            prix du patron chez le marchand (pc, table ItemSparse ; 0 = inconnu),\n")
+    f.write("--            toutes les réputations possibles \"faction:rang,...\" (une seule suffit),\n")
+    f.write("--            prix en Faveur du marchand (0 = pas en Faveur) }\n")
     f.write("-- source : T maître, V marchand, D butin, Q quête, W objet du monde ; vide = connue d'office\n")
     f.write("local _, ns = ...\n")
     f.write("ns.METIERS = {\n")
@@ -76,6 +87,6 @@ with open(out, "w", encoding="utf-8", newline="\n") as f:
     f.write("}\n")
     f.write("ns.RECETTES = {\n")
     for r in rows:
-        f.write('    {%d, %d, %d, %d, "%s", %d, %d, %d, %d, %d, "%s", %d, %d, %d},\n' % r)
+        f.write('    {%d, %d, %d, %d, "%s", %d, %d, %d, %d, %d, "%s", %d, %d, %d, "%s", %d},\n' % r)
     f.write("}\n")
 print(len(rows), "recettes")

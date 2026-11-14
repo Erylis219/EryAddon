@@ -18,7 +18,7 @@ local Quetes = { key = "quetes", label = "Carte : quêtes à prendre (sans Quest
 table.insert(ns.features, Quetes)
 ns.DEFAULTS.quetes = false -- coupée tant que Jérémie n'a pas choisi (il ne veut pas des données de Questie)
 
-local PIN_TAILLE = 11        -- taille des « ! » sur la carte (unités du canevas, comme les livres)
+local PIN_TAILLE = 11        -- taille des « ! » à L'ÉCRAN (même taille quel que soit le zoom, demande de Jérémie)
 local MAX_SPAWNS = 4         -- positions affichées au plus par PNJ et par carte (PNJ qui se déplacent)
 local BUDGET = 150           -- quêtes lues par image pendant la construction de l'index
 
@@ -267,7 +267,9 @@ local function Pin(n)
     if pins[n] then return pins[n] end
     local child = Canvas()
     local p = CreateFrame("Button", nil, child)
-    p:SetFrameLevel(child:GetFrameLevel() + 400)
+    -- (OpenMap : au-dessus de son dessin de la carte, OpenMapAPI.ArtTopLevel)
+    local top = _G.OpenMapAPI and _G.OpenMapAPI.ArtTopLevel and _G.OpenMapAPI.ArtTopLevel() or 0
+    p:SetFrameLevel(math.max(child:GetFrameLevel() + 400, (top or 0) + 5))
     p.tex = p:CreateTexture(nil, "OVERLAY")
     p.tex:SetAllPoints()
     p.tex:SetTexture("Interface\\GossipFrame\\AvailableQuestIcon")
@@ -277,30 +279,70 @@ local function Pin(n)
     return p
 end
 
+-- OPENMAP (09/11, Jérémie l'a installé : « j'ai plus les quêtes sur la map ») : sa carte « cousue » assemble
+-- toutes les zones sur le canevas de la carte du dessous (WorldMapFrame:GetMapID()). Une position de zone se
+-- convertit avec son API publique : zone → monde (WorldFromMap) → canevas de la carte du dessous (MapFromWorld).
+-- On place alors les « ! » de TOUTES les zones proches (pas seulement de la carte du dessous).
+local OM_MAX = 300
+-- Taille fixe à l'écran : le canevas grossit avec le zoom, on compense par son échelle.
+local function PinSize()
+    local child = Canvas()
+    local cs = child and child:GetEffectiveScale() or 1
+    local us = UIParent and UIParent:GetEffectiveScale() or 1
+    if not cs or cs <= 0 then return PIN_TAILLE end
+    return PIN_TAILLE * us / cs
+end
+local function ResizePins()
+    local s = PinSize()
+    for _, p in pairs(pins) do
+        if p:IsShown() then p:SetSize(s, s) end
+    end
+end
 RefreshPins = function()
     for _, p in pairs(pins) do p:Hide() end
     if not (Quetes.enabled and DB and starters and WorldMapFrame and WorldMapFrame:IsShown() and Canvas()) then return end
-    local list = starters[WorldMapFrame:GetMapID()]
-    if not list then return end
+    local host = WorldMapFrame:GetMapID()
+    local OM = _G.OpenMapAPI
+    local stitched = OM and OM.IsStitched and OM.IsStitched() and OM.WorldFromMap and OM.MapFromWorld
+    local maps = {}
+    if stitched then
+        for m in pairs(starters) do maps[#maps + 1] = m end
+    elseif starters[host] then
+        maps[1] = host
+    end
     local child = Canvas()
     local w, h = child:GetWidth(), child:GetHeight()
     local level = UnitLevel("player") or 1
     ReadLogTitles()
     local n = 0
-    for _, s in ipairs(list) do
-        local avail = {}
-        for _, qid in ipairs(s.quests) do
-            if Available(qid, level) then avail[#avail + 1] = qid end
-        end
-        if avail[1] then
+    local size = PinSize()
+    for _, m in ipairs(maps) do
+        for _, s in ipairs(starters[m]) do
+            local avail
             for _, pos in ipairs(s.pos) do
-                n = n + 1
-                local p = Pin(n)
-                p.starter, p.quests = s, avail
-                p:SetSize(PIN_TAILLE, PIN_TAILLE)
-                p:ClearAllPoints()
-                p:SetPoint("CENTER", child, "TOPLEFT", w * pos[1] / 100, -h * pos[2] / 100)
-                p:Show()
+                local cx, cy = pos[1] / 100, pos[2] / 100
+                if stitched then
+                    local u, v = OM.WorldFromMap(m, cx, cy)
+                    cx, cy = nil, nil
+                    if u then cx, cy = OM.MapFromWorld(host, u, v) end
+                end
+                -- (carte cousue : seulement autour de la vue, et pas plus de OM_MAX points)
+                if cx and cy and cx > -0.5 and cx < 1.5 and cy > -0.5 and cy < 1.5 and n < OM_MAX then
+                    if not avail then
+                        avail = {}
+                        for _, qid in ipairs(s.quests) do
+                            if Available(qid, level) then avail[#avail + 1] = qid end
+                        end
+                    end
+                    if not avail[1] then break end
+                    n = n + 1
+                    local p = Pin(n)
+                    p.starter, p.quests = s, avail
+                    p:SetSize(size, size)
+                    p:ClearAllPoints()
+                    p:SetPoint("CENTER", child, "TOPLEFT", w * cx, -h * cy)
+                    p:Show()
+                end
             end
         end
     end
@@ -401,6 +443,14 @@ local function HookMap()
     hooked = true
     WorldMapFrame:HookScript("OnShow", function() BuildIndex(); RefreshPins() end)
     if WorldMapFrame.OnMapChanged then hooksecurefunc(WorldMapFrame, "OnMapChanged", RefreshPins) end
+    -- Zoom : taille recalculée (pour rester petite à l'écran).
+    if WorldMapFrame.OnCanvasScaleChanged then hooksecurefunc(WorldMapFrame, "OnCanvasScaleChanged", ResizePins) end
+    -- OpenMap : passage carte cousue / carte de Blizzard → points replacés ; zoom de sa vue → taille.
+    local OM = _G.OpenMapAPI
+    if OM and OM.RegisterCallback then
+        pcall(OM.RegisterCallback, Quetes, "OpenMap_StitchedChanged", function() RefreshPins() end)
+        pcall(OM.RegisterCallback, Quetes, "OpenMap_ViewChanged", function() ResizePins() end)
+    end
 end
 
 function Quetes.Enable()
@@ -466,6 +516,7 @@ end)
 
 ns._QuetesBuild = function() starters = nil; building = false; BuildIndex() end -- (test hors jeu)
 ns._QuetesStarters = function() return starters end
+ns._QuetesRefresh = function() RefreshPins() end -- (test hors jeu)
 ns._QuetesAvailable = function(qid, level) DB = _G.LibQuestieDB; return Available(qid, level) end
 ns._QuetesOffer = function(npc, offered) -- (test hors jeu)
     local real = UnitGUID

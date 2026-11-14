@@ -1001,11 +1001,23 @@ local function Pin(i)
     return p
 end
 
+-- Taille FIXE À L'ÉCRAN (12/11, Jérémie : livre « énorme » en zoomant) : le canevas grossit avec le zoom,
+-- on compense par son échelle. LIVRE_ECRAN = taille vue à l'écran, quel que soit le zoom.
+local LIVRE_ECRAN = 18
+local function LivreSize()
+    local child = Canvas()
+    local cs = child and child:GetEffectiveScale()
+    local us = UIParent and UIParent:GetEffectiveScale() or 1
+    if not cs or cs <= 0 then return LIVRE_TAILLE end
+    return LIVRE_ECRAN * us / cs
+end
+
 local function Place(i, mapX, mapY, icon, title, where)
     local child = Canvas()
     local p = Pin(i)
     local w, h = child:GetWidth(), child:GetHeight()
-    p:SetSize(LIVRE_TAILLE, LIVRE_TAILLE)
+    local s = LivreSize()
+    p:SetSize(s, s)
     p.tex:SetTexture(icon)
     p.title, p.where, p.x, p.y = title, where, mapX, mapY
     p:ClearAllPoints()
@@ -1016,8 +1028,9 @@ end
 local function ShrinkForeverSecrets()
     local child = Canvas()
     if not child then return end
+    local s = LivreSize()
     for _, c in ipairs({ child:GetChildren() }) do
-        if c.book and c.tex then c:SetSize(LIVRE_TAILLE, LIVRE_TAILLE) end
+        if c.book and c.tex then c:SetSize(s, s) end
     end
 end
 
@@ -1165,6 +1178,11 @@ local function HookMap()
     if WorldMapFrame.OnMapChanged then hooksecurefunc(WorldMapFrame, "OnMapChanged", RefreshLivres) end
     -- Zoom de la carte : on remet les icônes à la bonne taille.
     if WorldMapFrame.OnCanvasScaleChanged then hooksecurefunc(WorldMapFrame, "OnCanvasScaleChanged", RefreshLivres) end
+    -- OpenMap : zoom de sa vue → taille recalculée.
+    local OM = _G.OpenMapAPI
+    if OM and OM.RegisterCallback then
+        pcall(OM.RegisterCallback, Livres, "OpenMap_ViewChanged", function() RefreshLivres() end)
+    end
 end
 
 function Livres.Enable()

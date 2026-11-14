@@ -443,18 +443,42 @@ ns.HVCanAutoSearch = function() return SQ.CanAuto() end
 -- Toute demande à l'HV compte dans SQ.seq (vécu 18:40 : un achat de Bauxite pendant la vérification lui a pris
 -- sa réponse → faux « muet ») ; les recherches d'objet comptent aussi pour la limite du jeu ; une action de ta
 -- part (recherche, achat, enchère) met le scan en pause. (Nos propres pages de scan ne le mettent pas en pause.)
-local USER_CALLS = { SendSearchQuery = true, SendSellSearchQuery = true, StartCommoditiesPurchase = true,
-    ConfirmCommoditiesPurchase = true, PlaceBid = true }
+-- RÈGLE DE JÉRÉMIE (09/11) : AUCUNE action n'est refusée pour cause de scan (« c'est pas possible ce genre de
+-- messages ») : le scan / la vérification se mettent en pause, ton action passe, puis ils reprennent. TOUTE
+-- demande à l'HV qui n'est pas une des nôtres (SQ.Own) compte comme ton action, y compris mise en vente,
+-- annulation, Mes enchères et la recherche de l'écran Acheter. Celle-ci (SendBrowseQuery / page suivante) prend
+-- le fil des pages du scan : le scan repartira de la 1re page (SQ.browseStolen), en gardant ce qu'il a lu.
+local BROWSE_CALLS = { SendBrowseQuery = true, RequestMoreBrowseResults = true }
 for _, fn in ipairs({ "SendSearchQuery", "SendSellSearchQuery", "StartCommoditiesPurchase", "ConfirmCommoditiesPurchase",
-    "PlaceBid", "QueryOwnedAuctions", "CancelAuction", "PostItem", "PostCommodity" }) do
+    "PlaceBid", "QueryOwnedAuctions", "CancelAuction", "PostItem", "PostCommodity", "SendBrowseQuery",
+    "RequestMoreBrowseResults" }) do
     if C_AuctionHouse and C_AuctionHouse[fn] then
         hooksecurefunc(C_AuctionHouse, fn, function()
-            SQ.seq = SQ.seq + 1
+            if not BROWSE_CALLS[fn] then SQ.seq = SQ.seq + 1 end
             if fn == "SendSearchQuery" or fn == "SendSellSearchQuery" then SQ.times[#SQ.times + 1] = GetTime() end
-            if USER_CALLS[fn] then SQ.PauseForUser() end
+            if SQ.mine then return end
+            if BROWSE_CALLS[fn] then
+                SQ.owner, SQ.browseWaiting = "autre", true
+                if scanRunning then SQ.browseStolen = true end
+            end
+            SQ.PauseForUser()
         end)
     end
 end
+-- Une de nos demandes automatiques, sans la compter comme ton action.
+function SQ.Own(fn, ...)
+    SQ.mine = true
+    local ok, err = pcall(fn, ...)
+    SQ.mine = false
+    if not ok then error(err) end
+end
+-- Tu es en train d'agir : action il y a moins de 3 s, ou recherche de l'écran Acheter encore sans réponse (10 s max).
+function SQ.UserBusy()
+    local since = GetTime() - (SQ.lastUser or 0)
+    return since < 3 or (SQ.browseWaiting and since < 10)
+end
+ns.HVUserAction = function() SQ.PauseForUser() end
+ns.HVBrowseOwner = function() return SQ.owner end
 local function NextPage()
     if C_AuctionHouse.HasFullBrowseResults() then
         -- Objets pas encore regardés (infos non chargées pendant le scan).
@@ -483,7 +507,8 @@ local function NextPage()
     if not SQ.Ready() then C_Timer.After(0.2, NextPage) return end
     scanToken = scanToken + 1
     local token = scanToken
-    C_AuctionHouse.RequestMoreBrowseResults()
+    SQ.owner = "scan"
+    SQ.Own(C_AuctionHouse.RequestMoreBrowseResults)
     -- Le serveur limite le rythme des demandes : sans réponse, on redemande. Deux fois sans réponse : le jeu a
     -- perdu le fil des pages (une autre demande est passée entre-temps) : on repart du début, en gardant tout ce
     -- qui est déjà lu (les objets déjà vus ne sont pas recomptés).
@@ -502,6 +527,7 @@ local function NextPage()
 end
 
 local function OnBrowseEvent(event, added)
+    if SQ.owner ~= "scan" then SQ.browseWaiting = false; return end -- réponse à ta recherche (écran Acheter)
     if not scanRunning then return end
     if SQ.first then
         SQ.first = false
@@ -534,7 +560,8 @@ function SQ.Send(token, try, waited)
         C_Timer.After(0.25, function() SQ.Send(token, try, waited + 1) end)
         return
     end
-    C_AuctionHouse.SendBrowseQuery(SQ.Query())
+    SQ.owner, SQ.browseStolen = "scan", false
+    SQ.Own(C_AuctionHouse.SendBrowseQuery, SQ.Query())
     C_Timer.After(8, function()
         if not (scanRunning and token == scanToken and SQ.first) then return end
         if try < SQ.TRIES then
@@ -721,7 +748,7 @@ function ns.Owned(itemID)
     local bank = ns.BankCount and ns.BankCount(itemID) or 0
     local r = EryAddonDB and EryAddonDB.enRoute and EryAddonDB.enRoute[itemID]
     if not r then return bag + bank, 0, bank end
-    if bag >= r.base + r.q or time() - r.t > 3 * 86400 then
+    if bag >= r.base + r.q or time() - r.t > 30 * 86400 then -- un courrier reste 30 jours
         EryAddonDB.enRoute[itemID] = nil
         return bag + bank, 0, bank
     end
@@ -729,7 +756,7 @@ function ns.Owned(itemID)
 end
 
 -- Boîte aux lettres ouverte : un objet en route qui n'y est plus a été pris (et peut-être déjà
--- utilisé) → on l'oublie. (2 minutes de grâce : le courrier d'un achat peut arriver en retard.)
+-- utilisé) → on l'oublie. (65 minutes de grâce : patch Forever du 10/11, le courrier met 60 min à arriver.)
 local mailFrame = CreateFrame("Frame")
 pcall(mailFrame.RegisterEvent, mailFrame, "MAIL_INBOX_UPDATE")
 mailFrame:SetScript("OnEvent", function()
@@ -744,7 +771,7 @@ mailFrame:SetScript("OnEvent", function()
     end
     local changed = false
     for id, r in pairs(route) do
-        if not inMail[id] and time() - r.t > 120 then route[id] = nil; changed = true end
+        if not inMail[id] and time() - r.t > 3900 then route[id] = nil; changed = true end
     end
     if changed and ns.JobsRefresh then ns.JobsRefresh() end
 end)
@@ -1171,6 +1198,11 @@ DetailNext = function()
     if not detailRunning then return end
     -- Pendant un achat, on laisse la place : on reprend une seconde plus tard. Limite du jeu atteinte : on attend.
     if BuyerBusy() or not SQ.CanAuto() then C_Timer.After(1, DetailNext); return end
+    if SQ.UserBusy() then -- ton action passe d'abord ; on reprend juste après
+        SetStatus("Vérification en pause : ton action passe d'abord.", "Vérif. en pause")
+        C_Timer.After(1, DetailNext)
+        return
+    end
     if not SQ.Ready() then C_Timer.After(0.2, DetailNext); return end -- le jeu n'est pas prêt : on attend
     detailCurrent = table.remove(detailQueue, 1)
     if not detailCurrent then
@@ -1186,7 +1218,7 @@ DetailNext = function()
         string.format("Vérif. %d/%d", detailTotal - #detailQueue, detailTotal))
     detailToken = detailToken + 1
     local token = detailToken
-    C_AuctionHouse.SendSearchQuery(SearchKey(e), PRICE_SORT, not e.commodity)
+    SQ.Own(C_AuctionHouse.SendSearchQuery, SearchKey(e), PRICE_SORT, not e.commodity)
     local seq = SQ.seq
     -- Sans réponse en 4 s : réessayé UNE fois en fin de liste ; muet (sauté 7 jours) au 2e silence.
     C_Timer.After(4, function()
@@ -1423,13 +1455,17 @@ local Course -- achat de composant en cours (onglet Jobs), voir ns.BuyReagent pl
 -- dernier achat, et quand plus rien n'est en cours.
 function SQ.TryResume()
     if not (scanRunning and SQ.paused) then return end
-    local busy = Course ~= nil or GetTime() - (SQ.lastUser or 0) < 3
+    local busy = Course ~= nil or SQ.UserBusy()
     local st = Buyer.state
     if st == "searching" or st == "starting" or st == "confirm" or st == "buying" then busy = true end
     if busy then C_Timer.After(1, SQ.TryResume) return end
     SQ.paused, SQ.lost = false, 0
     scanToken = scanToken + 1
+    if SQ.browseStolen then -- l'écran Acheter a pris le fil des pages : relecture depuis la 1re (rien de perdu)
+        SQ.first = true
+    end
     if SQ.first then
+        SetStatus("Scan : reprise…", "Scan : reprise")
         SQ.Send(scanToken, 1, 0)
     else
         SetStatus("Scan : reprise…", "Scan : reprise")
@@ -2038,8 +2074,12 @@ local function RecordPost(itemLocation, quantity, unitPrice, duration, isItem)
         end
         if ok then deposit = d end
     end
+    -- Coût FIGÉ au moment de la mise en vente (avec son origine) : le bénéfice d'une vente faite ne doit plus
+    -- bouger quand les prix changent ensuite (remarque de Jérémie, 11/11).
+    local cost, origin
+    if ns.CostBasis then cost, origin = ns.CostBasis(id) end
     table.insert(MV().annonces, { id = id, name = name, qty = quantity, left = quantity, unit = unitPrice,
-        t = time(), cost = ns.CostBasis and ns.CostBasis(id) or nil, deposit = deposit })
+        t = time(), cost = cost, co = origin, cv = 2, deposit = deposit })
 end
 
 if C_AuctionHouse and hooksecurefunc then
@@ -2062,7 +2102,7 @@ local function OnSoldText(name)
     local d = MV()
     d.ventesSansCourrier = d.ventesSansCourrier or {}
     local sale = { name = name, t = time(), posted = a and a.t, unit = a and a.unit, cost = a and a.cost,
-        id = a and a.id }
+        id = a and a.id, co = a and a.co, cv = a and a.cv }
     if a and a.qty == 1 then
         sale.qty, sale.closed = 1, true
         table.remove(d.annonces, ai)
@@ -2134,8 +2174,16 @@ local function ReadInvoices()
             local key = table.concat({ itemName, buyout, deposit or 0, fee or 0, count or 0 }, "|")
             present[key] = (present[key] or 0) + 1
             if present[key] > (d.courriers[key] or 0) then
+                -- Vente faite pendant que tu étais DÉCONNECTÉ (pas de ligne dans le chat) : l'heure se déduit du
+                -- courrier. Un courrier de l'HV vit 30 jours et part 60 min après la vente (patch du 10/11) :
+                -- vente ≈ maintenant − (30 − jours restants) − 1 h.
+                local okH, _, _, _, _, _, _, daysLeft = pcall(GetInboxHeaderInfo, i)
+                local soldT
+                if okH and type(daysLeft) == "number" and daysLeft > 0 and daysLeft <= 30 then
+                    soldT = math.floor(time() - (30 - daysLeft) * 86400 - 3600)
+                end
                 list[#list + 1] = { name = itemName, gross = InvoiceGross(bid, buyout, fee), fee = fee or 0,
-                    count = count, key = key }
+                    count = count, key = key, soldT = soldT }
                 -- Valeurs brutes des 10 derniers courriers (diagnostic, lisible par Claude).
                 d.brut = d.brut or {}
                 table.insert(d.brut, 1, table.concat({ itemName, tostring(bid), tostring(buyout), tostring(deposit),
@@ -2156,26 +2204,79 @@ local function ReadInvoices()
         if not (sale and sale.closed) then a, ai = OldestPost(inv.name) end
         local unit = (sale and sale.unit) or (a and a.unit)
         local qty = inv.count or (unit and unit > 0 and math.max(1, math.floor(inv.gross / unit + 0.5))) or 1
-        if a then
-            a.left = (a.left or 0) - qty
-            if a.left <= 0 then table.remove(d.annonces, ai) end
+        -- BUG VU (10/11, « 21 Huiles des ténèbres vendues » pour une dizaine) : le chat annonce une ligne par
+        -- ACHETEUR, le courrier regroupe plusieurs ventes. Un courrier de 14 ne retirait qu'UNE ligne du chat :
+        -- les autres restaient comptées en plus (Élixir d'Agilité inférieur : 14 + 16 + 2 lignes = 32).
+        -- Chaque ligne du chat vaut au moins 1 objet : un courrier de N objets en retire jusqu'à N.
+        local extra = qty - ((sale and sale.qty) or 1)
+        local list2 = d.ventesSansCourrier or {}
+        local i = 1
+        while extra > 0 and i <= #list2 do
+            if list2[i].name == inv.name then extra = extra - (list2[i].qty or 1); table.remove(list2, i) else i = i + 1 end
         end
+        -- Un courrier de 12 peut couvrir plusieurs annonces (vu : 2 annonces de 6 Huiles, la 2e restait « en vente ») :
+        -- on vide les annonces de cet objet de la plus ancienne à la plus récente.
+        local first = a
+        local rest = a and qty or 0
+        while a and rest > 0 do
+            local take = math.min(rest, a.left or 0)
+            a.left, rest = (a.left or 0) - take, rest - take
+            if a.left <= 0 then table.remove(d.annonces, ai) end
+            a, ai = OldestPost(inv.name)
+        end
+        a = first
+        local posted = (sale and sale.posted) or (a and a.t)
+        local soldAt = (sale and sale.t) or inv.soldT or time()
+        if posted and soldAt < posted then soldAt = posted end -- heure déduite du courrier : jamais avant la mise en vente
         AddFait({ kind = "vendu", id = (sale and sale.id) or (a and a.id), name = inv.name, qty = qty,
-            net = inv.gross - inv.fee, t = (sale and sale.t) or nil, posted = (sale and sale.posted) or (a and a.t),
-            cost = (sale and sale.cost) or (a and a.cost) })
+            net = inv.gross - inv.fee, t = soldAt, posted = posted,
+            cost = (sale and sale.cost) or (a and a.cost), co = (sale and sale.co) or (a and a.co),
+            cv = (sale and sale.cv) or (a and a.cv) })
     end
+end
+-- Boîte aux lettres lue : une vente du chat de plus de 2 h dont aucun courrier n'est arrivé est forcément déjà
+-- comptée par un courrier lu avant (anciennes lignes restées en double, voir plus haut) : on l'oublie. Si un
+-- courrier arrive quand même plus tard, il est compté normalement (rien n'est perdu).
+local function PurgeOldChatSales()
+    local d = MV()
+    local now, keep = time(), {}
+    for _, s in ipairs(d.ventesSansCourrier or {}) do
+        if not s.t or now - s.t < 7200 then keep[#keep + 1] = s end
+    end
+    d.ventesSansCourrier = keep
 end
 local mailWatch = CreateFrame("Frame")
 pcall(mailWatch.RegisterEvent, mailWatch, "MAIL_INBOX_UPDATE")
-mailWatch:SetScript("OnEvent", function() pcall(ReadInvoices) end)
+mailWatch:SetScript("OnEvent", function() pcall(ReadInvoices); pcall(PurgeOldChatSales) end)
 
 -- Bilan d'un objet (nil si aucune vente ni expiration) : { vendus, net, benef (si coût connu),
 -- delai (heures, moyenne), expires, depotPerdu, enCours }
 -- since (facultatif) : seulement ce qui s'est passé depuis cette heure (périodes de l'écran Mes ventes).
+-- Une seule fois : les ventes / annonces notées avant le coût figé (cv = 2) prennent le coût d'aujourd'hui (acheté /
+-- fabriqué / ramassé), puis ne bougent plus. (Avant le 08/11 elles portaient parfois un prix du marché inventé.)
+local function FreezeOldCosts(d)
+    if d.coutsFiges or not ns.CostBasis then return end
+    for _, list in ipairs({ d.faits or {}, d.ventesSansCourrier or {}, d.annonces or {} }) do
+        for _, x in ipairs(list) do
+            if not x.cv and x.id and x.kind ~= "expire" and x.kind ~= "retire" then
+                -- depuis le 09/11 00:00 (1794178800), le coût noté est déjà le vrai (acheté / fabriqué / ramassé)
+                if not (x.cost and (x.posted or x.t or 0) >= 1794178800) then
+                    x.cost, x.co = ns.CostBasis(x.id)
+                elseif not x.co then
+                    x.co = select(2, ns.CostBasis(x.id)) -- l'origine n'était pas notée : celle d'aujourd'hui
+                end
+                x.cv = 2
+            end
+        end
+    end
+    d.coutsFiges = true
+end
+
 function ns.MySales(itemID, since)
     local d = EryAddonDB and EryAddonDB.mesVentes
     if not d then return nil end
     RepairInvoiceNets(d)
+    FreezeOldCosts(d)
     local s = { vendus = 0, net = 0, benef = 0, coutConnu = true, delai = 0, nDelai = 0, expires = 0,
         depotPerdu = 0, enCours = 0 }
     local any = false
@@ -2185,7 +2286,10 @@ function ns.MySales(itemID, since)
             if f.kind == "vendu" then
                 s.vendus = s.vendus + (f.qty or 0)
                 s.net = s.net + (f.net or 0)
-                if f.cost then s.benef = s.benef + (f.net or 0) - f.cost * (f.qty or 0) else s.coutConnu = false end
+                s.benef = s.benef + (f.net or 0) - (f.cost or 0) * (f.qty or 0)
+                s.coutTot = (s.coutTot or 0) + (f.cost or 0) * (f.qty or 0)
+                if not f.cost then s.coutConnu = false end
+                if f.co then s.co = f.co end
                 if f.t and f.posted then s.delai = s.delai + (f.t - f.posted) / 3600; s.nDelai = s.nDelai + 1 end
             else
                 s.expires = s.expires + (f.qty or 0)
@@ -2202,7 +2306,10 @@ function ns.MySales(itemID, since)
             s.vendus = s.vendus + q
             local net = (v.unit or 0) * q * 0.95
             s.net = s.net + net
-            if v.cost then s.benef = s.benef + net - v.cost * q else s.coutConnu = false end
+            s.benef = s.benef + net - (v.cost or 0) * q
+            s.coutTot = (s.coutTot or 0) + (v.cost or 0) * q
+            if not v.cost then s.coutConnu = false end
+            if v.co then s.co = v.co end
             if v.t and v.posted then s.delai = s.delai + (v.t - v.posted) / 3600; s.nDelai = s.nDelai + 1 end
             s.estime = true
         end
@@ -2214,6 +2321,32 @@ function ns.MySales(itemID, since)
     s.delaiMoyen = s.nDelai > 0 and (s.delai / s.nDelai) or nil
     s.benef = s.benef - s.depotPerdu
     return s
+end
+
+-- Tes enchères réelles, lues dans l'HV (écran Mes enchères, OWNED_AUCTIONS_UPDATED) : real[objet] = quantité encore
+-- en vente. Nos notes (annonces) ne sont qu'une déduction (mises en vente, chat, courriers) et peuvent se tromper
+-- (vu 10/11 : « 11 Huiles en vente » pour 2 réelles). Devant l'HV, on les ramène à la réalité : trop d'objets notés
+-- → on retire les plus anciens (déjà vendus ou expirés).
+function ns.SyncOwnedAuctions(real)
+    local d = EryAddonDB and EryAddonDB.mesVentes
+    if not (d and d.annonces) then return end
+    local noted = {}
+    for _, a in ipairs(d.annonces) do
+        if a.id then noted[a.id] = (noted[a.id] or 0) + (a.left or 0) end
+    end
+    for id, n in pairs(noted) do
+        local extra = n - (real[id] or 0)
+        local i = 1
+        while extra > 0 and i <= #d.annonces do
+            local a = d.annonces[i]
+            -- (une annonce posée il y a moins de 15 s peut ne pas encore être dans la liste du jeu : on n'y touche pas)
+            if a.id == id and (a.left or 0) > 0 and time() - (a.t or 0) > 15 then
+                local take = math.min(extra, a.left)
+                a.left, extra = a.left - take, extra - take
+            end
+            if a.id == id and (a.left or 0) <= 0 then table.remove(d.annonces, i) else i = i + 1 end
+        end
+    end
 end
 
 -- Tous les objets que tu as vendus ou mis en vente, pour l'onglet « Mes ventes ».
@@ -2491,7 +2624,8 @@ frame:SetScript("OnEvent", function(_, event, ...)
         C_Timer.After(0.5, DetailNext)
     elseif event == "AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED" or event == "AUCTION_HOUSE_BROWSE_FAILURE" then
         -- Le serveur a jeté une demande : si c'est la 1re du scan, on la renvoie dès qu'il est prêt.
-        if scanRunning and SQ.first and SQ.try < SQ.TRIES then
+        if event == "AUCTION_HOUSE_BROWSE_FAILURE" and SQ.owner ~= "scan" then SQ.browseWaiting = false end
+        if scanRunning and SQ.first and not SQ.paused and SQ.try < SQ.TRIES then -- en pause : la reprise renverra
             scanToken = scanToken + 1
             local token, try = scanToken, SQ.try + 1
             SetStatus(string.format("Demande refusée par le serveur, nouvel essai (%d / %d)…", try, SQ.TRIES),
@@ -2586,7 +2720,8 @@ local Sacs = {
 table.insert(ns.features, Sacs)
 ns.DEFAULTS.hvSacs = true
 
-local DEPOSIT = 100        -- 1 pa : dépôt minimum, perdu seulement en cas d'invendu
+-- Patch Forever du 10/11 : dépôt minimum 1 pc (avant 1 pa). Marge minimale gardée à 10 pc (ancienne règle).
+local DEPOSIT = 10         -- 10 pc : marge minimale (le dépôt n'est perdu qu'en cas d'invendu)
 local COMMISSION = 0.05    -- 5 % (confirmé)
 local MARGIN = 0.20        -- l'HV doit rapporter au moins 20 % de plus que le marchand...
 local MARGIN_MIN = DEPOSIT -- ... et au moins le dépôt qu'on risque

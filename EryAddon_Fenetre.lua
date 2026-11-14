@@ -474,6 +474,7 @@ end
 
 local function SetPrice(p)
     price = (p and p > 0) and Silver(p) or 0
+    V.manual = nil -- prix posé par FDC (ou un bouton), pas tapé à la main
     V.po.edit:SetText(math.floor(price / 10000))
     V.pa.edit:SetText(math.floor(price / 100) % 100)
     V.pc.edit:SetText(price % 100)
@@ -533,7 +534,7 @@ function F.IsOpen() return win ~= nil and win:IsShown() end
 F._Test = function() return V, sel, price, qty, durIdx, listings end -- pour le test hors jeu
 
 function F.Select(entry)
-    if ns._StopDetails then ns._StopDetails() end -- la vérification laisse la place (une recherche à la fois)
+    if ns.HVUserAction then ns.HVUserAction() end -- scan / vérification en pause, ils reprennent après
     sel = entry
     listings, choice = nil, nil
     qty = entry.count
@@ -582,10 +583,18 @@ local function Blocked()
     if sel.vendor > 0 and price * (1 - COMMISSION) < sel.vendor then
         return "Bloqué sous " .. Money(math.ceil(sel.vendor / (1 - COMMISSION))) .. " (prix marchand)"
     end
-    -- RÈGLE DE JÉRÉMIE (09/11) : jamais en vente sans être le moins cher (égalité comprise).
+    -- RÈGLE DE JÉRÉMIE (09/11) : jamais en vente sans être le moins cher (égalité comprise)...
     if listings == nil then return "Lecture des annonces…" end
     local low = LowestOther()
-    if low and price >= low then return "Plus cher que " .. Money(low) .. " : passe dessous" end
+    if low and price >= low then
+        -- ... SAUF prix tapé à la main (14/11 : annonce d'un autre à 88 pc au lieu de 1 pa 88, pas rentable à
+        -- racheter) : on laisse vendre, avec un avertissement (2e valeur).
+        if not V.manual then return "Plus cher que " .. Money(low) .. " : passe dessous" end
+        local n = 0
+        for _, l in ipairs(listings) do if l.p < price then n = n + (l.q - l.own) end end
+        return nil, n > 0 and string.format("%d moins chère%s devant toi (dès %s)", n, n > 1 and "s" or "", Money(low))
+            or ("À égalité avec " .. Money(low))
+    end
 end
 
 local function LockCopper()
@@ -674,7 +683,7 @@ function F.UpdateSell()
     V.profit:SetTextColor(unpack(profit >= 0 and Hc.GREEN or Hc.RED))
 
     -- Bouton et message.
-    local block = Blocked()
+    local block, warn = Blocked()
     if V.pending then
         V.go:SetLabel("Confirmer")
         V.go:SetEnabled(true)
@@ -691,6 +700,9 @@ function F.UpdateSell()
         if V.error and time() - V.error.t < 15 then
             V.note:SetText(V.error.text)
             V.note:SetTextColor(unpack(Hc.RED))
+        elseif warn then
+            V.note:SetText(warn)
+            V.note:SetTextColor(unpack(Hc.ORANGE))
         else
             V.note:SetText("")
         end
@@ -833,7 +845,7 @@ local function CreateSellScreen(content)
     maxB:SetPoint("LEFT", V.qty, "RIGHT", 8, 0)
     maxB:SetScript("OnClick", function() if sel then qty = sel.count; V.qty.edit:SetText(qty); F.UpdateSell() end end)
     local pl = Hc.Label(c, "Prix à l'unité", 11, { 0.5, 0.64, 0.7 }); pl:SetPoint("TOPLEFT", IN + half + 16, -100)
-    local function OnPrice() ReadPrice(); F.UpdateSell() end
+    local function OnPrice() ReadPrice(); V.manual = true; F.UpdateSell() end
     local pw = math.floor((half - 16) / 3)
     V.po = NumberBox(c, pw, 44, 20, OnPrice); V.po:SetPoint("TOPLEFT", pl, "BOTTOMLEFT", 0, -6)
     V.pa = NumberBox(c, pw, 44, 20, OnPrice); V.pa:SetPoint("LEFT", V.po, "RIGHT", 8, 0)
@@ -984,6 +996,27 @@ local function MaxAffordable(e)
     return lo
 end
 
+-- Modes de tri de la liste (clé → valeur d'une recette) et sens du 1er clic (vrai = du plus grand au plus petit).
+local SORT_KEYS = {
+    niveau = function(e) return e.learn end,
+    chance = function(e) return e.chance end,
+    vente = function(e) return e.rate end,
+    gain = function(e) return e.gain end,
+    recette = function(e) return e.learnCost end,
+}
+local SORT_FIRST_DESC = { niveau = false, chance = true, vente = true, gain = true, recette = false }
+local SORT_TIPS = { niveau = "niveau de la recette", chance = "chance de gagner un point",
+    vente = "% des annonces qui se vendent (TSM)", gain = "gain par fabrication", recette = "prix de la recette à apprendre" }
+
+local function MetiersSort()
+    local t = EryAddonDB.metiersTri
+    if type(t) ~= "table" or not SORT_KEYS[t.k] then
+        t = { k = "gain", desc = true }
+        EryAddonDB.metiersTri = t
+    end
+    return t
+end
+
 local function BuildList()
     mList = {}
     if not (mProf and API()) then return end
@@ -997,10 +1030,25 @@ local function BuildList()
             mList[#mList + 1] = e
         end
     end
+    -- % des annonces qui se vendent (TSM, DBRegionSaleRate, 0 à 1) ; nil sans TSM ou objet inconnu.
+    for _, e in ipairs(mList) do e.rate = ns.TSM and ns.TSM("DBRegionSaleRate", e.out) or nil end
+    for _, e in ipairs(mList) do e.learnCost = (not e.known) and API().LearnCost(e) or 0 end
+    -- Tri choisi en cliquant sur un titre de colonne (demande de Jérémie, 14/11) : niveau, chance, % vente, gain,
+    -- prix de la recette ; 2e clic sur le même titre = ordre inversé. Valeur inconnue (nil) toujours en bas ;
+    -- à égalité : gain, puis chance.
+    local t = MetiersSort()
+    local get = SORT_KEYS[t.k] or SORT_KEYS.gain
+    local function Cmp(va, vb, desc)
+        if (va ~= nil) ~= (vb ~= nil) then return va ~= nil end
+        if va ~= nil and va ~= vb then if desc then return va > vb else return va < vb end end
+    end
     table.sort(mList, function(a, b)
-        if (a.gain ~= nil) ~= (b.gain ~= nil) then return a.gain ~= nil end
-        if a.gain and b.gain and a.gain ~= b.gain then return a.gain > b.gain end
-        return a.chance > b.chance
+        local r = Cmp(get(a), get(b), t.desc)
+        if r ~= nil then return r end
+        r = Cmp(a.gain, b.gain, true)
+        if r ~= nil then return r end
+        if (a.chance or 0) ~= (b.chance or 0) then return (a.chance or 0) > (b.chance or 0) end
+        return (a.name or "") < (b.name or "")
     end)
 end
 
@@ -1014,7 +1062,15 @@ local function DrawList()
             local ci = COLOR_INFO[e.color]
             row.name:SetText(e.name)
             if ci then row.name:SetTextColor(unpack(ci[2])) else row.name:SetTextColor(unpack(H().TEXT)) end
+            row.level:SetText(e.learn or "")
             row.chance:SetText(string.format("%d %%", math.floor((e.chance or 0) * 100 + 0.5)))
+            if e.rate then
+                row.rate:SetText(string.format("%d %%", math.floor(e.rate * 100 + 0.5)))
+                row.rate:SetTextColor(unpack(e.rate >= 0.5 and H().GREEN or (e.rate >= 0.2 and H().ORANGE or H().RED)))
+            else
+                row.rate:SetText("?")
+                row.rate:SetTextColor(unpack(H().SOFT))
+            end
             if e.gain then
                 row.gain:SetText((e.gain >= 0 and "+" or "-") .. Money(math.abs(e.gain)))
                 row.gain:SetTextColor(unpack(e.gain >= 0 and H().GREEN or H().RED))
@@ -1022,7 +1078,7 @@ local function DrawList()
                 row.gain:SetText("?")
                 row.gain:SetTextColor(unpack(H().SOFT))
             end
-            local learn = (not e.known) and API().LearnCost(e) or 0
+            local learn = e.learnCost or 0
             row.recipe:SetText(learn > 0 and Money(learn) or "")
             row.sel:SetShown(mSel and mSel.spell == e.spell)
             row:Show()
@@ -1235,6 +1291,7 @@ function F.RefreshMetiers(keepList)
     if not mProf then mProf = API().Professions()[1] end
     DrawTabs()
     if not keepList then BuildList() end
+    if Mt.markSort then Mt.markSort() end
     if mSel then
         -- Recette recalculée (prix, sacs) : on reprend la nouvelle entrée de la même recette.
         for _, e in ipairs(mList) do if e.spell == mSel.spell then mSel = e end end
@@ -1339,7 +1396,10 @@ local function VendorList(itemID, vend)
     local list = {}
     for _, npc in ipairs(vendors) do
         local best = { npc = npc, name = QDB("Npc", npc, "name") or ("PNJ n° " .. npc), d = 1e12 }
-        for area, pts in pairs(QDB("Npc", npc, "spawns") or {}) do
+        local moved = ns.NPC_MOVED and ns.NPC_MOVED[npc]
+        local spawns = moved and { [moved.area] = { { moved.x, moved.y } } } or QDB("Npc", npc, "spawns") or {}
+        local zoneMap = moved and { [moved.area] = moved.map } or zoneMap
+        for area, pts in pairs(spawns) do
             local map = zoneMap[area]
             if map and type(pts) == "table" then
                 for _, p in ipairs(pts) do
@@ -1519,17 +1579,53 @@ function F.CreateMetiersScreen(parent)
     monter:SetScript("OnClick", function(self) EryAddonDB.jobsMonter = self:GetChecked() and true or false; F.RefreshMetiers() end)
 
     -- Liste des recettes (gauche).
-    local listW, top = 400, -110
+    local listW, top = 478, -110 -- (+78 le 14/11 : colonnes « Niv. » et « % vente », le nom garde sa largeur)
     local list = Panel(parent)
     list:SetPoint("TOPLEFT", PAD, top)
     list:SetSize(listW, ch + top - PAD)
     local head = CreateFrame("Frame", nil, list)
     head:SetPoint("TOPLEFT", 1, -1); head:SetPoint("TOPRIGHT", -1, -1); head:SetHeight(30)
     local hb = Hc.Tex(head, "BACKGROUND", { 0.039, 0.082, 0.125 }, 1); hb:SetAllPoints()
-    local h1 = Hc.Label(head, "Recette", 11, { 0.5, 0.64, 0.7 }); h1:SetPoint("LEFT", 12, 0)
-    local h2 = Hc.Label(head, "Chance", 11, { 0.5, 0.64, 0.7 }); h2:SetPoint("RIGHT", head, "RIGHT", -176, 0)
-    local h3 = Hc.Label(head, "Gain", 11, { 0.5, 0.64, 0.7 }); h3:SetPoint("RIGHT", head, "RIGHT", -86, 0)
-    local h4 = Hc.Label(head, "Recette", 11, { 0.5, 0.64, 0.7 }); h4:SetPoint("RIGHT", head, "RIGHT", -12, 0)
+    local h1 = Hc.Label(head, "Recette", 11, { 0.5, 0.64, 0.7 }); h1:SetPoint("LEFT", 66, 0)
+    -- Titres de colonnes = TRI (demande de Jérémie, 14/11) : clic = trier par cette colonne, 2e clic = ordre
+    -- inversé. Colonne du tri en cyan, avec « + » (du plus grand au plus petit) ou « - » à côté.
+    local sortHeads = {}
+    local function SortHead(text, key, anchor, x)
+        local hbtn = CreateFrame("Button", nil, head)
+        hbtn.label = Hc.Label(hbtn, text, 11, { 0.5, 0.64, 0.7 })
+        hbtn.label:SetPoint(anchor, 0, 0)
+        hbtn:SetPoint(anchor, head, anchor, x, 0)
+        hbtn:SetSize(hbtn.label:GetStringWidth() + 14, 30)
+        hbtn.text, hbtn.key = text, key
+        hbtn:SetScript("OnClick", function(self)
+            local t = MetiersSort()
+            if t.k == self.key then t.desc = not t.desc else t.k, t.desc = self.key, SORT_FIRST_DESC[self.key] end
+            mOffset = 0
+            F.RefreshMetiers()
+        end)
+        hbtn:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_TOP")
+            GameTooltip:AddLine("Trier par " .. SORT_TIPS[self.key])
+            if MetiersSort().k == self.key then GameTooltip:AddLine("Reclique pour inverser l'ordre", 0.6, 0.6, 0.6) end
+            GameTooltip:Show()
+        end)
+        hbtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        sortHeads[#sortHeads + 1] = hbtn
+    end
+    SortHead("Niv.", "niveau", "LEFT", 36)
+    SortHead("Chance", "chance", "RIGHT", -224)
+    SortHead("% vente", "vente", "RIGHT", -176)
+    SortHead("Gain", "gain", "RIGHT", -86)
+    SortHead("Recette", "recette", "RIGHT", -12)
+    Mt.markSort = function()
+        local t = MetiersSort()
+        for _, hbtn in ipairs(sortHeads) do
+            local on = t.k == hbtn.key
+            hbtn.label:SetText(on and (hbtn.text .. (t.desc and " +" or " -")) or hbtn.text)
+            hbtn.label:SetTextColor(unpack(on and Hc.CYAN or { 0.5, 0.64, 0.7 }))
+        end
+    end
+    Mt.markSort()
     Mt.rows = {}
     for i = 1, MLIST_ROWS do
         local r = CreateFrame("Button", nil, list)
@@ -1540,9 +1636,14 @@ function F.CreateMetiersScreen(parent)
         r.icon = r:CreateTexture(nil, "ARTWORK"); r.icon:SetSize(24, 24); r.icon:SetPoint("LEFT", 8, 0)
         -- Colonne Chance de largeur fixe, et le nom s'arrête 8 px avant (coupé avec « … ») : il ne passe
         -- plus sous « 100 % » (retour de Jérémie, 08/11).
-        r.chance = Hc.Text(r, 13, Hc.SOFT); r.chance:SetPoint("RIGHT", r, "RIGHT", -176, 0); r.chance:SetJustifyH("RIGHT")
+        r.chance = Hc.Text(r, 13, Hc.SOFT); r.chance:SetPoint("RIGHT", r, "RIGHT", -224, 0); r.chance:SetJustifyH("RIGHT")
         r.chance:SetWidth(46)
-        r.name = Hc.Text(r, 14, Hc.TEXT); r.name:SetPoint("LEFT", r.icon, "RIGHT", 8, 0)
+        r.rate = Hc.Text(r, 13, Hc.SOFT); r.rate:SetPoint("RIGHT", r, "RIGHT", -176, 0); r.rate:SetJustifyH("RIGHT")
+        r.rate:SetWidth(42)
+        -- Niveau de la recette (colonne « Niv. », 14/11), entre l'icône et le nom.
+        r.level = Hc.Text(r, 12, Hc.SOFT); r.level:SetPoint("LEFT", r.icon, "RIGHT", 4, 0)
+        r.level:SetWidth(26); r.level:SetJustifyH("CENTER")
+        r.name = Hc.Text(r, 14, Hc.TEXT); r.name:SetPoint("LEFT", r.level, "RIGHT", 4, 0)
         r.name:SetPoint("RIGHT", r.chance, "LEFT", -8, 0)
         r.gain = Hc.Text(r, 13, Hc.GREEN); r.gain:SetPoint("RIGHT", r, "RIGHT", -86, 0); r.gain:SetJustifyH("RIGHT")
         -- Prix de la recette à apprendre (orange), vide si tu la connais (comme l'ancien onglet, demande de Jérémie).
@@ -1849,13 +1950,24 @@ local function ReadOwned()
             local a = { id = info.auctionID, key = k, keyStr = KeyStr(k), itemID = k.itemID, link = info.itemLink,
                 name = (okI and ki and ki.itemName) or name or ("objet " .. k.itemID), icon = icon or (okI and ki and ki.iconFileID),
                 qty = qty, commodity = commodity, sold = info.status == 1, left = info.timeLeftSeconds,
-                -- Prix à l'unité : les marchandises donnent déjà l'unité, un objet donne le prix de l'annonce.
-                unit = commodity and buyout or math.floor(buyout / math.max(1, qty)) }
+                -- Prix à l'unité : une marchandise EN VENTE donne déjà l'unité ; une marchandise VENDUE donne le total
+                -- (vu 10/11 : 3 Huiles vendues affichées « 1 po 10 pa 91 / u » = 3 x 36 pa 97) ; un objet donne le prix
+                -- de l'annonce.
+                unit = (commodity and info.status ~= 1) and buyout or math.floor(buyout / math.max(1, qty)) }
             a.deposit = KnownDeposit(a)
             local okC, cost = pcall(C_AuctionHouse.GetCancelCost, info.auctionID)
             a.cancelCost = okC and cost or nil
             enAuctions[#enAuctions + 1] = a
         end
+    end
+    -- La liste du jeu fait foi pour « En vente » de Mes ventes (demande de Jérémie : « je suis sur l'HV, il est censé
+    -- savoir »).
+    if ns.SyncOwnedAuctions then
+        local real = {}
+        for _, a in ipairs(enAuctions) do
+            if not a.sold then real[a.itemID] = (real[a.itemID] or 0) + a.qty end
+        end
+        ns.SyncOwnedAuctions(real)
     end
 end
 
@@ -1993,7 +2105,7 @@ local function CheckNext()
 end
 
 local function StartChecks()
-    if ns._StopDetails then ns._StopDetails() end
+    if ns.HVUserAction then ns.HVUserAction() end
     local seen = {}
     enQueue = {}
     for _, a in ipairs(enAuctions) do
@@ -2172,7 +2284,8 @@ local function OnCanceled()
     F.RefreshEncheres()
 end
 
--- Boîte aux lettres ouverte : un objet annulé qui n'y est plus a été relevé (2 min de grâce), ou 30 jours passés.
+-- Boîte aux lettres ouverte : un objet annulé qui n'y est plus a été relevé (65 min de grâce : le courrier met
+-- 60 min à arriver depuis le patch Forever du 10/11), ou 30 jours passés.
 local function OnMail()
     local list = EryAddonDB and EryAddonDB.auCourrier
     if not list or #list == 0 or not GetInboxNumItems then return end
@@ -2185,7 +2298,7 @@ local function OnMail()
     end
     for i = #list, 1, -1 do
         local m = list[i]
-        if (not inMail[m.itemID] and time() - m.t > 120) or time() - m.t > 30 * 86400 then table.remove(list, i) end
+        if (not inMail[m.itemID] and time() - m.t > 3900) or time() - m.t > 30 * 86400 then table.remove(list, i) end
     end
 end
 F._TestEncheres = function() return enAuctions, enChecks, DrawEncheres, ReadOwned, OnCheckResults, StartChecks end
@@ -2562,9 +2675,10 @@ end
 ---------------------------------------------------------------------------
 -- Écran MES VENTES (maquette corrigée, 08/11) : ce que tu as VRAIMENT gagné, par objet, sur une période
 -- (aujourd'hui / 7 jours / depuis le début). Ventes : ns.MySales / ns.MySalesItems (EryAddon_HV.lua : factures
--- du courrier, sinon prix de l'annonce − 5 % en attendant le courrier). Coût : ns.CostBasis = acheté /
--- fabriqué / ramassé (0), recalculé ici pour toutes les ventes (plus de prix du marché inventé).
--- Bénéfice = net − coût x vendus − dépôts perdus.
+-- du courrier, sinon prix de l'annonce − 5 % en attendant le courrier). Coût : FIGÉ à la mise en vente (acheté /
+-- fabriqué / ramassé, ns.CostBasis à ce moment-là) ; bénéfice = ns.MySales().benef = net − coût figé − dépôts perdus.
+-- (11/11, Jérémie : avant, le coût était recalculé à l'affichage aux prix du jour → le bénéfice d'une vente FAITE
+-- bougeait avec le marché.)
 ---------------------------------------------------------------------------
 local Mv = {}
 local mvPeriod = "week"
@@ -2584,11 +2698,14 @@ end
 local function MvRows()
     local rows = {}
     for _, s in ipairs(ns.MySalesItems and ns.MySalesItems(MvSince()) or {}) do
-        local cost, origin = 0, "ramassé"
-        if ns.CostBasis then cost, origin = ns.CostBasis(s.id) end
-        cost = cost or 0
-        s.cost, s.origin = cost, origin
-        s.profit = (s.net or 0) - cost * (s.vendus or 0) - (s.depotPerdu or 0)
+        if (s.vendus or 0) > 0 then
+            s.cost, s.origin = (s.coutTot or 0) / s.vendus, s.co or "ramassé"
+        else -- rien de vendu sur la période (seulement des invendus) : coût d'aujourd'hui, pour info
+            local cost, origin = 0, "ramassé"
+            if ns.CostBasis then cost, origin = ns.CostBasis(s.id) end
+            s.cost, s.origin = cost or 0, origin
+        end
+        s.profit = s.benef or 0
         rows[#rows + 1] = s
     end
     table.sort(rows, function(a, b) return a.profit > b.profit end)
@@ -2928,31 +3045,40 @@ local function DrawAcheter()
         end
     end
     f.listState:SetText(acListings == nil and "recherche…" or (#listings == 0 and "plus rien en vente" or ""))
-    -- Achat.
-    f.qtyBox:SetShown(e.commodity)
+    -- Achat. La quantité saisie vaut pour les deux sortes d'objets (demande de Jérémie, 14/11) :
+    -- empilable = tout d'un coup ; non empilable = le jeu exige un clic par annonce, chaque clic prend la
+    -- suivante la moins chère jusqu'à la quantité voulue (sans attendre une nouvelle recherche).
+    f.qtyBox:SetShown(true)
     local label, enabled = "Acheter", false
+    local avail, total, left = 0, 0, acQty
+    for _, l in ipairs(listings) do
+        local n = math.max(0, l.q - l.own)
+        if not e.commodity and not l.auctionID then n = 0 end
+        avail = avail + n
+        if left > 0 then local k = math.min(left, n); total = total + k * l.p; left = left - k end
+    end
+    -- (annonces pas encore lues : on ne touche pas à ce que tu as tapé)
+    if acListings and acQty > avail then acQty = math.max(1, avail) end
+    if not f.qtyEdit:HasFocus() then f.qtyEdit:SetText(acQty) end
+    Ac.total = total
+    local poor = total > GetMoney()
     if e.commodity then
-        local avail, total, left = 0, 0, acQty
-        for _, l in ipairs(listings) do
-            local n = math.max(0, l.q - l.own)
-            avail = avail + n
-            if left > 0 then local k = math.min(left, n); total = total + k * l.p; left = left - k end
-        end
-        if acQty > avail then acQty = math.max(1, avail) end
-        if not f.qtyEdit:HasFocus() then f.qtyEdit:SetText(acQty) end
-        Ac.total = total
         if avail > 0 then
             label = string.format("Acheter %d · %s", acQty, Money(total))
-            enabled = total <= GetMoney()
+            enabled = not poor
         end
-        f.note:SetText(total > GetMoney() and "|cffff7373Pas assez d'argent.|r" or "Total confirmé par le serveur · arrive par courrier")
+        f.note:SetText(poor and "|cffff7373Pas assez d'argent.|r" or "Total confirmé par le serveur · arrive par courrier")
     else
-        if not acPick then for _, l in ipairs(listings) do if l.own == 0 and l.auctionID then acPick = l break end end end
+        if acPick and (acPick.q - acPick.own) <= 0 then acPick = nil end
+        if not acPick then for _, l in ipairs(listings) do if l.own == 0 and l.auctionID and l.q > 0 then acPick = l break end end end
         if acPick then
-            label = "Acheter 1 · " .. Money(acPick.p)
+            label = acQty > 1 and string.format("Acheter 1 sur %d · %s", acQty, Money(acPick.p))
+                or ("Acheter 1 · " .. Money(acPick.p))
             enabled = acPick.p <= GetMoney()
         end
-        f.note:SetText("1 clic = 1 annonce · arrive par courrier")
+        f.note:SetText(poor and acQty > 1 and string.format("|cffff7373Pas assez d'argent pour %d (%s).|r", acQty, Money(total))
+            or (acQty > 1 and string.format("Total pour %d : %s · 1 clic = 1 annonce", acQty, Money(total))
+            or "1 clic = 1 annonce · arrive par courrier"))
     end
     if acPending and EryAddonDB.hvConfirmBlocked then label, enabled = "Confirmer l'achat", true
     elseif acPending or acBid then label, enabled = "Achat en cours…", false end
@@ -3003,11 +3129,8 @@ function F.AcheterSearch()
         C_Timer.After(0.3, F.AcheterSearch)
         return
     end
-    if ns.AnoAPI and ns.AnoAPI.IsScanning and ns.AnoAPI.IsScanning() then
-        Msg("scan de l'HV en cours : recherche possible à la fin du scan.")
-        return
-    end
-    if ns._StopDetails then ns._StopDetails() end
+    -- Scan ou vérification en cours : ils se mettent en pause et reprennent après (règle de Jérémie, 09/11).
+    if ns.HVUserAction then ns.HVUserAction() end
     acResults, acOffset, Ac.searching = {}, 0, true
     local text = Ac.search.edit:GetText() or ""
     C_AuctionHouse.SendBrowseQuery({ searchString = text, sorts = {
@@ -3019,7 +3142,7 @@ end
 
 local function OnBrowse()
     if not (Ac.frame and Ac.frame:IsVisible() and Ac.searching ~= nil) then return end
-    if ns.AnoAPI and ns.AnoAPI.IsScanning and ns.AnoAPI.IsScanning() then return end
+    if ns.HVBrowseOwner and ns.HVBrowseOwner() == "scan" then return end -- pages du scan, pas ta recherche
     Ac.searching = false
     ReadBrowse()
     DrawAcheter()
@@ -3039,7 +3162,7 @@ local function AcBuy()
         ns.BuyReagent(e.id, acQty, unit, e.name)
         C_Timer.After(20, function() if acPending and time() - acPending.t >= 20 then acPending = nil; DrawAcheter() end end)
     elseif acPick and acPick.auctionID then
-        acBid = { id = e.id, price = acPick.p, money = GetMoney(), t = time() }
+        acBid = { id = e.id, price = acPick.p, money = GetMoney(), t = time(), l = acPick }
         local ok = pcall(C_AuctionHouse.PlaceBid, acPick.auctionID, acPick.p)
         if not ok then acBid = nil; Msg("achat refusé : " .. e.name) end
         C_Timer.After(6, function()
@@ -3078,7 +3201,17 @@ function F.AcOnMoney()
     if b and b.money - GetMoney() >= math.floor(b.price * 0.9) then
         acBid = nil
         Msg(string.format("acheté : 1 x %s pour %s (arrive par courrier).", acSel and acSel.name or "objet", Money(b.price)))
-        AcBought(b.id, b.price, 1, true)
+        -- Annonce retirée de la liste tout de suite, compteur baissé : le clic suivant prend la suivante.
+        if b.l then b.l.q = b.l.q - 1 end
+        if acPick == b.l then acPick = nil end
+        if acQty > 1 then
+            acQty = acQty - 1
+            EryAddonDB.prixPaye = EryAddonDB.prixPaye or {}
+            EryAddonDB.prixPaye[b.id] = { unit = b.price, t = time() }
+            if ns.AddInbound then ns.AddInbound(b.id, 1) end
+        else
+            AcBought(b.id, b.price, 1, true) -- dernier de la série : annonces relues
+        end
     end
     if Ac.frame and Ac.frame:IsVisible() then DrawAcheter() end
 end
@@ -3188,8 +3321,13 @@ function F.CreateAcheterScreen(parent)
     t:SetScript("OnMouseWheel", function(_, delta)
         acOffset = math.max(0, acOffset - delta * 3)
         -- Bas de la liste atteint : on demande la page suivante au serveur.
-        if acOffset + AC_ROWS >= #acResults and C_AuctionHouse.HasFullBrowseResults and not C_AuctionHouse.HasFullBrowseResults() then
-            C_AuctionHouse.RequestMoreBrowseResults()
+        if acOffset + AC_ROWS >= #acResults then
+            if ns.HVBrowseOwner and ns.HVBrowseOwner() == "scan" then
+                -- le scan a repris le fil des pages entre-temps : ta recherche est relancée (il se remet en pause)
+                if Ac.searching ~= nil then F.AcheterSearch() return end
+            elseif C_AuctionHouse.HasFullBrowseResults and not C_AuctionHouse.HasFullBrowseResults() then
+                C_AuctionHouse.RequestMoreBrowseResults()
+            end
         end
         DrawAcheter()
     end)

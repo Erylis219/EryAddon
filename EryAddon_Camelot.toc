@@ -2,7 +2,7 @@
 ## Title: FDC - Federytion Du Commerce
 ## Notes: Hôtel des ventes, métiers et plus (client français). Tapez /fdc pour activer ou désactiver chaque fonction.
 ## Author: Jérémie
-## Version: 0.54.0
+## Version: 0.55.0
 ## SavedVariables: EryAddonDB
 ## X-Curse-Project-ID: 1791316
 

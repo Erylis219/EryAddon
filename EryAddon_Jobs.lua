@@ -223,7 +223,43 @@ end
 -- Ex. Élixir d'Esprit mineur, recette de butin propre à Forever, que le maître n'a pas.)
 -- Réputation suffisante pour acheter le patron ? (ex. patrons de l'Île de Zéphras : Amical avec
 -- les Druides et druidesses de la Noctegriffe). Inconnue = on suppose que non.
+local function StandingOf(faction)
+    if C_Reputation and C_Reputation.GetFactionDataByID then
+        local ok, d = pcall(C_Reputation.GetFactionDataByID, faction)
+        if ok and type(d) == "table" and type(d.reaction) == "number" then return d.reaction end
+    end
+    if GetFactionInfoByID then
+        local ok, _, _, standing = pcall(GetFactionInfoByID, faction)
+        if ok and type(standing) == "number" then return standing end
+    end
+end
+-- Réputations possibles d'une recette (champ 15 « faction:rang,… », sinon champs 12 / 13).
+local function RepPairs(r)
+    local list = {}
+    for f, k in (r[15] or ""):gmatch("(%d+):(%d+)") do list[#list + 1] = { tonumber(f), tonumber(k) } end
+    if not list[1] and (r[12] or 0) > 0 then list[1] = { r[12], r[13] or 0 } end
+    return list
+end
+-- La réputation à viser : celle déjà atteinte, sinon celle dont tu es le plus proche (faction connue du jeu
+-- d'abord, puis rang le plus bas). Renvoie faction, rang exigé, rang actuel (ou nil).
+local function RepWant(r)
+    local best, bestGap
+    for _, p in ipairs(RepPairs(r)) do
+        local now = StandingOf(p[1])
+        local gap = now and (p[2] - now) or (100 + p[2])
+        if not bestGap or gap < bestGap then best, bestGap = p, gap end
+    end
+    if not best then return nil end
+    return best[1], best[2], StandingOf(best[1])
+end
 local function RepOK(r)
+    if r[15] and r[15] ~= "" then
+        for _, p in ipairs(RepPairs(r)) do
+            local now = StandingOf(p[1])
+            if now and now >= p[2] then return true end
+        end
+        return false
+    end
     local faction, rank = r[12] or 0, r[13] or 0
     if faction == 0 then return true end
     if C_Reputation and C_Reputation.GetFactionDataByID then
@@ -253,7 +289,7 @@ end
 
 -- « Monter réputation : Amical avec … (tu es : Neutre) » si la réputation manque, sinon nil.
 local function RepLine(e)
-    if (e.repFaction or 0) == 0 or RepOK({ [12] = e.repFaction, [13] = e.repRank }) then return nil end
+    if (e.repFaction or 0) == 0 or (e.r and RepOK(e.r)) then return nil end
     local name, now = FactionInfo(e.repFaction)
     local need = _G["FACTION_STANDING_LABEL" .. e.repRank] or ("rang " .. e.repRank)
     local nowText = now and _G["FACTION_STANDING_LABEL" .. now]
@@ -265,13 +301,36 @@ end
 -- (ou neutres), « Nom (zone) ». Noms des PNJ via Questie, gardés en mémoire.
 local npcNames = {}
 local RecipeSources -- défini plus bas (base Questie)
-local function VendorNames(vend)
-    local list = {}
+-- PNJ DÉPLACÉS dans Forever (10/11, vécu : Jornah absent d'Orgrimmar) : les « Supply Officers » de Season of
+-- Discovery ont été regroupés dans un camp par faction ; WhatsTraining et QuestieDB gardent leurs anciennes villes.
+-- Horde : camp Durotar Supply and Logistics près de la Croisée des chemins (Tarides, zone 17, carte 1413, ~49.5 29.4,
+-- guides wowforever.be / Method / WoW Handbook) ; Alliance : Azeroth Commerce Authority, Trois-Chemins (Les
+-- Carmines, zone 44, carte 1433, ~9.8 71.6). Position de chacun dans le camp : approximative.
+ns.NPC_MOVED = {
+    [214070] = { area = 17, map = 1413, x = 49.5, y = 29.4 }, -- Jornah (était à Orgrimmar)
+    [214096] = { area = 17, map = 1413, x = 49.4, y = 29.4 }, -- Gishah (était aux Pitons-du-Tonnerre)
+    [214098] = { area = 17, map = 1413, x = 49.5, y = 29.5 }, -- (était à Fossoyeuse)
+    [213077] = { area = 44, map = 1433, x = 9.8, y = 71.6 },
+    [214099] = { area = 44, map = 1433, x = 9.8, y = 71.6 },
+    [214101] = { area = 44, map = 1433, x = 9.8, y = 71.6 },
+}
+-- PNJ dont la réputation est connue (une recette « Gelkis OU Magram » : chacun son intendant).
+ns.NPC_REP = { [253140] = 92, [253139] = 93 } -- Molkar = centaures Gelkis, Gorhak = centaures Magram
+-- Prix réel quand le patron ne se paie pas en or (sinon on affichait le prix « or » des données du jeu, faux) :
+-- Faveur du marchand (champ 16, WhatsTraining) ; totems pour les intendants centaures (guides Forever :
+-- 15 au rang Honoré ou moins, 60 à Exalté).
+local function CurrencyText(r, faction, rank)
+    if (r[16] or 0) > 0 then return r[16] .. " Faveurs du marchand" end
+    if faction == 92 or faction == 93 then return ((rank or 8) <= 6 and 15 or 60) .. " totems de centaure" end
+end
+local function VendorNames(vend, wantFaction)
+    local list, matched = {}, false
     local mine = (UnitFactionGroup and UnitFactionGroup("player") == "Alliance") and "A" or "H"
     local Q = _G.LibQuestieDB
     for npc, area, fac in (vend or ""):gmatch("(%d+):(%d+):?(%a?)") do
         if fac == "" or fac == "N" or fac == mine then
             npc, area = tonumber(npc), tonumber(area)
+            if ns.NPC_MOVED[npc] then area = ns.NPC_MOVED[npc].area end
             if npcNames[npc] == nil then
                 local name = false
                 if Q and Q.Npc and Q.Npc.Get then
@@ -282,10 +341,13 @@ local function VendorNames(vend)
             end
             local zone = C_Map and C_Map.GetAreaInfo and C_Map.GetAreaInfo(area)
             if zone then zone = zone:gsub("%s*%b()", "") end
-            list[#list + 1] = (npcNames[npc] or ("PNJ n° " .. npc)) .. (zone and (" (" .. zone .. ")") or "")
+            local text = (npcNames[npc] or ("PNJ n° " .. npc)) .. (zone and (" (" .. zone .. ")") or "")
+            -- l'intendant de la réputation visée passe en premier
+            if wantFaction and ns.NPC_REP[npc] == wantFaction then table.insert(list, 1, text); matched = true
+            else list[#list + 1] = text end
         end
     end
-    return list
+    return list, matched
 end
 
 -- Les façons d'apprendre une recette, et la MOINS CHÈRE (demande de Jérémie) :
@@ -297,10 +359,13 @@ local function LearnOptions(r)
     local src, teach = r[5] or "", r[7] or 0
     if src:find("T") then o.trainer = r[6] or 0 end
     if src:find("V") and teach > 0 then
-        o.vendors = VendorNames(r[11])
+        o.repFaction, o.repRank, o.repNow = RepWant(r)
+        o.vendors, o.vendorMatched = VendorNames(r[11], o.repFaction)
         if not o.vendors[1] and (r[11] or "") == "" then o.vendors = RecipeSources(teach).vendors end
-        o.vendorPrice = PrixMarchand(teach) or (((r[14] or 0) > 0) and r[14] or nil)
-        o.vendorOK = RepOK(r) and ((r[11] or "") == "" or o.vendors[1] ~= nil)
+        o.currency = CurrencyText(r, o.repFaction, o.repRank)
+        o.vendorPrice = (not o.currency) and (PrixMarchand(teach) or (((r[14] or 0) > 0) and r[14] or nil)) or nil
+        o.repOK = RepOK(r)
+        o.vendorOK = o.repOK and ((r[11] or "") == "" or o.vendors[1] ~= nil)
         o.otherFaction = (r[11] or "") ~= "" and not o.vendors[1]
     end
     if teach > 0 then o.hv = PrixHV(teach) end
@@ -326,9 +391,20 @@ local function LearnLabel(r)
     if o.best == "HV" then return "patron à l'HV " .. Money(o.hv) end
     if o.best == "marchand" or (o.vendors and o.vendors[1]) then
         local names = o.vendors or {}
-        local where = names[1] and ("chez " .. names[1] .. (#names > 1 and string.format(" ou %d autre%s", #names - 1,
-            #names > 2 and "s" or "") or "")) or "chez un marchand"
-        return "patron " .. (o.vendorPrice and (Money(o.vendorPrice) .. " ") or "") .. where
+        -- (un intendant propre à la réputation visée : lui seul, l'autre PNJ demande une autre réputation)
+        local others = (#names > 1 and not o.vendorMatched) and string.format(" ou %d autre%s", #names - 1,
+            #names > 2 and "s" or "") or ""
+        local where = names[1] and ("chez " .. names[1] .. others) or "chez un marchand"
+        local price = o.currency or (o.vendorPrice and Money(o.vendorPrice))
+        if o.repFaction and not o.repOK then
+            -- « Requiert Honoré auprès de … » (demande de Jérémie : afficher clairement, sans mensonge)
+            local fname = FactionInfo(o.repFaction)
+            local need = _G["FACTION_STANDING_LABEL" .. o.repRank] or ("rang " .. o.repRank)
+            local now = o.repNow and _G["FACTION_STANDING_LABEL" .. o.repNow]
+            return string.format("patron %s · requiert %s auprès de %s%s%s", where, need, fname,
+                now and (" (tu es " .. now .. ")") or "", price and (" · " .. price) or "")
+        end
+        return "patron " .. (price and (price .. " ") or "") .. where
     end
     if o.otherFaction then
         return "patron vendu seulement à l'" .. ((UnitFactionGroup and UnitFactionGroup("player") == "Alliance")
@@ -429,7 +505,8 @@ local function AddLearnLines(e)
     -- marchand moins cher (ou prix inconnu) → les deux.
     local showVendor = o.vendors and o.vendors[1] and not (o.hv and o.vendorPrice and o.hv <= o.vendorPrice)
     if showVendor then
-        tip:AddLine("Patron" .. (o.vendorPrice and (" " .. Money(o.vendorPrice)) or "") .. " chez :", 1, 0.82, 0)
+        tip:AddLine("Patron" .. ((o.currency and (" " .. o.currency)) or (o.vendorPrice and (" " .. Money(o.vendorPrice))) or "")
+            .. " chez :", 1, 0.82, 0)
         for i, v in ipairs(o.vendors) do
             if i > 3 then tip:AddLine(string.format("  … et %d autres", #o.vendors - 3), 0.7, 0.7, 0.7) break end
             tip:AddLine("  " .. v, 0.9, 0.9, 0.9)
@@ -649,7 +726,7 @@ local function Compute(profID, skill, onlySpell)
                 learnLabel = not known and LearnLabel(r) or nil,
                 teach = r[7], hardToGet = not known and not Obtainable(r), r = r,
                 src = r[5], trainerCost = r[6], prof = prof,
-                vend = r[11] or "", repFaction = r[12] or 0, repRank = r[13] or 0,
+                vend = r[11] or "", repFaction = (RepWant(r)) or 0, repRank = select(2, RepWant(r)) or 0,
                 reag = reag, skill = skill,
             }
         end
@@ -1090,10 +1167,12 @@ local function Needs(e, want)
             row.cost = cost
             achats[#achats + 1] = "la recette"
         else
-            local price = e.r and LearnOptions(e.r).vendorPrice
-            local repLocked = (e.repFaction or 0) > 0 and not RepOK({ [12] = e.repFaction, [13] = e.repRank })
+            local lo = e.r and LearnOptions(e.r)
+            local price = lo and lo.vendorPrice
+            local repLocked = e.r and not RepOK(e.r)
             row.have, row.missing = 0, 1
-            row.price = (price and (Money(price) .. " |cff5f8a99marchand|r") or "|cffff7373pas en vente|r")
+            row.price = (lo and lo.currency and (lo.currency .. " |cff5f8a99marchand|r"))
+                or (price and (Money(price) .. " |cff5f8a99marchand|r") or "|cffff7373pas en vente|r")
                 .. (repLocked and " |cffff9933· réputation d'abord|r" or "")
             info.apres = nil
         end
